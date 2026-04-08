@@ -1,0 +1,60 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Climate Optimizer Zone",
+        "description": "Create a virtual climate entity that uses a room sensor to control a downstream mini split.",
+        "data": {
+          "name": "Zone name",
+          "source_temp_sensor": "Room temperature sensor",
+          "source_humidity_sensor": "Room humidity sensor (optional)",
+          "downstream_climate": "Downstream climate entity (the mini split)",
+          "heat_target": "Heat target (\u00b0F)",
+          "cool_target": "Cool target (\u00b0F)",
+          "deadband": "Hysteresis / deadband (\u00b0F)",
+          "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
+          "min_cycle_time": "Minimum cycle time (seconds)",
+          "tick_interval": "Control loop interval (seconds)",
+          "emergency_enable": "Enable emergency fallback when the room sensor is unavailable",
+          "outdoor_temp_sensor": "Outdoor temperature sensor (optional, for emergency fallback)",
+          "emergency_heat_below_outdoor": "Emergency: force heat when outdoor is below (\u00b0F)",
+          "emergency_cool_above_outdoor": "Emergency: force cool when outdoor is above (\u00b0F)",
+          "emergency_heat_setpoint": "Emergency heat setpoint sent to mini split (\u00b0F)",
+          "emergency_cool_setpoint": "Emergency cool setpoint sent to mini split (\u00b0F)",
+          "emergency_fan_mode": "Emergency fan mode (e.g. low)"
+        }
+      }
+    },
+    "error": {
+      "targets_invalid": "Heat target must be lower than cool target"
+    },
+    "abort": {
+      "already_configured": "This sensor + climate pair is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Climate Optimizer Options",
+        "data": {
+          "heat_target": "Heat target (\u00b0F)",
+          "cool_target": "Cool target (\u00b0F)",
+          "deadband": "Hysteresis / deadband (\u00b0F)",
+          "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
+          "min_cycle_time": "Minimum cycle time (seconds)",
+          "tick_interval": "Control loop interval (seconds)",
+          "emergency_enable": "Enable emergency fallback when the room sensor is unavailable",
+          "outdoor_temp_sensor": "Outdoor temperature sensor (optional, for emergency fallback)",
+          "emergency_heat_below_outdoor": "Emergency: force heat when outdoor is below (\u00b0F)",
+          "emergency_cool_above_outdoor": "Emergency: force cool when outdoor is above (\u00b0F)",
+          "emergency_heat_setpoint": "Emergency heat setpoint sent to mini split (\u00b0F)",
+          "emergency_cool_setpoint": "Emergency cool setpoint sent to mini split (\u00b0F)",
+          "emergency_fan_mode": "Emergency fan mode (e.g. low)"
+        }
+      }
+    },
+    "error": {
+      "targets_invalid": "Heat target must be lower than cool target"
+    }
+  }
+}

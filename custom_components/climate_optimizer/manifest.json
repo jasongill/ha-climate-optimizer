@@ -1,0 +1,12 @@
+{
+  "domain": "climate_optimizer",
+  "name": "Climate Optimizer",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/jasongill/ha-climate-optimizer",
+  "issue_tracker": "https://github.com/jasongill/ha-climate-optimizer/issues",
+  "codeowners": ["@jasongill"],
+  "dependencies": [],
+  "requirements": [],
+  "iot_class": "calculated"
+}
