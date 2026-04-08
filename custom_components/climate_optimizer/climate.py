@@ -1,4 +1,4 @@
-"""Virtual zone climate entity that drives a downstream climate device."""
+"""Virtual climate entity that drives a downstream climate device."""
 from __future__ import annotations
 
 import logging
@@ -6,7 +6,12 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.climate import (
+    ATTR_FAN_MODE,
+    ATTR_FAN_MODES,
     ATTR_HVAC_MODE,
+    ATTR_MAX_TEMP,
+    ATTR_MIN_TEMP,
+    ATTR_TARGET_TEMP_STEP,
     ClimateEntity,
     ClimateEntityFeature,
     HVACAction,
@@ -41,7 +46,6 @@ from .const import (
     CONF_EMERGENCY_FAN_MODE,
     CONF_EMERGENCY_HEAT_BELOW_OUTDOOR,
     CONF_EMERGENCY_HEAT_SETPOINT,
-    CONF_FAN_TIERS,
     CONF_HEAT_TARGET,
     CONF_MIN_CYCLE_TIME,
     CONF_OUTDOOR_TEMP_SENSOR,
@@ -49,14 +53,8 @@ from .const import (
     CONF_SOURCE_HUMIDITY_SENSOR,
     CONF_SOURCE_TEMP_SENSOR,
     CONF_TICK_INTERVAL,
-    DEFAULT_EMERGENCY_COOL_ABOVE_OUTDOOR,
-    DEFAULT_EMERGENCY_COOL_SETPOINT,
-    DEFAULT_EMERGENCY_ENABLE,
-    DEFAULT_EMERGENCY_FAN_MODE,
-    DEFAULT_EMERGENCY_HEAT_BELOW_OUTDOOR,
-    DEFAULT_EMERGENCY_HEAT_SETPOINT,
-    DEFAULT_FAN_TIERS,
     DOMAIN,
+    FAN_TIER_KEYS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -67,8 +65,9 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Set up the virtual climate entity for a config entry."""
     merged = {**entry.data, **entry.options}
-    async_add_entities([VirtualZoneClimate(hass, entry, merged)])
+    async_add_entities([VirtualClimateDevice(entry, merged)])
 
 
 def _as_float(state: State | None) -> float | None:
@@ -80,8 +79,25 @@ def _as_float(state: State | None) -> float | None:
         return None
 
 
-class VirtualZoneClimate(ClimateEntity):
-    """Virtual climate entity that controls a downstream minisplit from a room sensor."""
+def _build_fan_tiers(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read the flat tier fields from config, sorted by ascending max_error."""
+    tiers: list[dict[str, Any]] = []
+    for err_key, err_default, mode_key, mode_default in FAN_TIER_KEYS:
+        mode = str(cfg.get(mode_key, mode_default)).strip()
+        if not mode:
+            continue
+        tiers.append(
+            {
+                "max_error": float(cfg.get(err_key, err_default)),
+                "fan_mode": mode,
+            }
+        )
+    tiers.sort(key=lambda t: t["max_error"])
+    return tiers
+
+
+class VirtualClimateDevice(ClimateEntity):
+    """Virtual climate entity that drives a downstream unit from a room sensor."""
 
     _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
     _attr_hvac_modes = [
@@ -98,25 +114,23 @@ class VirtualZoneClimate(ClimateEntity):
     )
     _attr_should_poll = False
 
-    def __init__(
-        self, hass: HomeAssistant, entry: ConfigEntry, cfg: dict[str, Any]
-    ) -> None:
-        self.hass = hass
-        self._entry = entry
+    def __init__(self, entry: ConfigEntry, cfg: dict[str, Any]) -> None:
+        self._entry_id = entry.entry_id
 
         self._attr_name = cfg[CONF_NAME]
-        self._attr_unique_id = f"{entry.entry_id}_zone_climate"
-        self._area_id: str | None = cfg.get(CONF_AREA_ID)
+        self._attr_unique_id = f"{entry.entry_id}_virtual_climate"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
             name=cfg[CONF_NAME],
             manufacturer="Climate Optimizer",
-            model="Virtual Zone",
+            model="Virtual Climate Device",
         )
+        self._area_id: str | None = cfg.get(CONF_AREA_ID)
 
         self._source_temp: str = cfg[CONF_SOURCE_TEMP_SENSOR]
         self._source_humidity: str | None = cfg.get(CONF_SOURCE_HUMIDITY_SENSOR)
         self._downstream: str = cfg[CONF_DOWNSTREAM_CLIMATE]
+        self._outdoor_sensor: str | None = cfg.get(CONF_OUTDOOR_TEMP_SENSOR)
 
         self._heat_target = float(cfg[CONF_HEAT_TARGET])
         self._cool_target = float(cfg[CONF_COOL_TARGET])
@@ -124,49 +138,25 @@ class VirtualZoneClimate(ClimateEntity):
         self._offset = float(cfg[CONF_SETPOINT_OFFSET])
         self._min_cycle = int(cfg[CONF_MIN_CYCLE_TIME])
         self._tick_interval = int(cfg[CONF_TICK_INTERVAL])
-        self._fan_tiers: list[dict[str, Any]] = (
-            cfg.get(CONF_FAN_TIERS) or DEFAULT_FAN_TIERS
-        )
+        self._fan_tiers = _build_fan_tiers(cfg)
 
-        self._outdoor_sensor: str | None = cfg.get(CONF_OUTDOOR_TEMP_SENSOR)
-        self._emergency_enable: bool = bool(
-            cfg.get(CONF_EMERGENCY_ENABLE, DEFAULT_EMERGENCY_ENABLE)
-        )
-        self._emergency_heat_below: float = float(
-            cfg.get(
-                CONF_EMERGENCY_HEAT_BELOW_OUTDOOR,
-                DEFAULT_EMERGENCY_HEAT_BELOW_OUTDOOR,
-            )
-        )
-        self._emergency_cool_above: float = float(
-            cfg.get(
-                CONF_EMERGENCY_COOL_ABOVE_OUTDOOR,
-                DEFAULT_EMERGENCY_COOL_ABOVE_OUTDOOR,
-            )
-        )
-        self._emergency_heat_setpoint: float = float(
-            cfg.get(CONF_EMERGENCY_HEAT_SETPOINT, DEFAULT_EMERGENCY_HEAT_SETPOINT)
-        )
-        self._emergency_cool_setpoint: float = float(
-            cfg.get(CONF_EMERGENCY_COOL_SETPOINT, DEFAULT_EMERGENCY_COOL_SETPOINT)
-        )
-        self._emergency_fan_mode: str = str(
-            cfg.get(CONF_EMERGENCY_FAN_MODE, DEFAULT_EMERGENCY_FAN_MODE)
-        )
+        self._emergency_enable = bool(cfg[CONF_EMERGENCY_ENABLE])
+        self._emergency_heat_below = float(cfg[CONF_EMERGENCY_HEAT_BELOW_OUTDOOR])
+        self._emergency_cool_above = float(cfg[CONF_EMERGENCY_COOL_ABOVE_OUTDOOR])
+        self._emergency_heat_setpoint = float(cfg[CONF_EMERGENCY_HEAT_SETPOINT])
+        self._emergency_cool_setpoint = float(cfg[CONF_EMERGENCY_COOL_SETPOINT])
+        self._emergency_fan_mode = str(cfg[CONF_EMERGENCY_FAN_MODE])
 
         self._attr_hvac_mode = HVACMode.HEAT_COOL
         self._attr_hvac_action = HVACAction.IDLE
         self._attr_fan_mode: str | None = None
 
-        self._active_mode: HVACMode | None = None  # HEAT / COOL while running
-        self._emergency_active: bool = False
+        self._active_mode: HVACMode | None = None
+        self._emergency_active = False
         self._last_transition: datetime | None = None
         self._last_sent: dict[str, Any] = {}
 
-        # Human-readable explanation of what the state machine last decided,
-        # plus the numeric details that drove the decision. Exposed as
-        # entity attributes so the user can understand what's happening.
-        self._decision_reason: str = "Starting up"
+        self._decision_reason = "Starting up"
         self._last_room_temp: float | None = None
         self._last_error: float | None = None
         self._last_pushed_setpoint: float | None = None
@@ -196,12 +186,10 @@ class VirtualZoneClimate(ClimateEntity):
             )
         )
 
-        # If the user picked an area in the config flow, assign it on the
-        # device registry entry so it shows up in the room's UI card.
         if self._area_id:
             dev_reg = dr.async_get(self.hass)
             device = dev_reg.async_get_device(
-                identifiers={(DOMAIN, self._entry.entry_id)}
+                identifiers={(DOMAIN, self._entry_id)}
             )
             if device is not None and device.area_id != self._area_id:
                 dev_reg.async_update_device(device.id, area_id=self._area_id)
@@ -230,30 +218,18 @@ class VirtualZoneClimate(ClimateEntity):
 
     @property
     def min_temp(self) -> float:
-        ds = self.hass.states.get(self._downstream)
-        if ds is not None:
-            try:
-                return float(ds.attributes.get("min_temp", 45))
-            except (TypeError, ValueError):
-                pass
-        return 45.0
+        return self._downstream_limits()[0]
 
     @property
     def max_temp(self) -> float:
-        ds = self.hass.states.get(self._downstream)
-        if ds is not None:
-            try:
-                return float(ds.attributes.get("max_temp", 95))
-            except (TypeError, ValueError):
-                pass
-        return 95.0
+        return self._downstream_limits()[1]
 
     @property
     def fan_modes(self) -> list[str] | None:
         ds = self.hass.states.get(self._downstream)
         if ds is None:
             return None
-        return ds.attributes.get("fan_modes")
+        return ds.attributes.get(ATTR_FAN_MODES)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -291,7 +267,6 @@ class VirtualZoneClimate(ClimateEntity):
 
         if hvac_mode is not None:
             self._attr_hvac_mode = hvac_mode
-
         if low is not None:
             self._heat_target = float(low)
         if high is not None:
@@ -319,20 +294,16 @@ class VirtualZoneClimate(ClimateEntity):
             await self._async_stop_downstream()
             self._active_mode = None
             self._attr_hvac_action = HVACAction.OFF
-        else:
-            # If the currently-running mode is no longer permitted, stop it.
-            if (
-                self._active_mode == HVACMode.COOL and hvac_mode == HVACMode.HEAT
-            ) or (
-                self._active_mode == HVACMode.HEAT and hvac_mode == HVACMode.COOL
-            ):
-                await self._async_stop_downstream()
-                self._active_mode = None
+        elif (
+            (self._active_mode == HVACMode.COOL and hvac_mode == HVACMode.HEAT)
+            or (self._active_mode == HVACMode.HEAT and hvac_mode == HVACMode.COOL)
+        ):
+            await self._async_stop_downstream()
+            self._active_mode = None
         self.async_write_ha_state()
         await self._async_control()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        # Manual fan override; forwards straight through to downstream.
         await self.hass.services.async_call(
             "climate",
             "set_fan_mode",
@@ -361,7 +332,8 @@ class VirtualZoneClimate(ClimateEntity):
 
     async def _async_control(self) -> None:
         if self._attr_hvac_mode == HVACMode.OFF:
-            self._decision_reason = "Virtual entity is OFF"
+            self._decision_reason = "Virtual device is OFF"
+            self.async_write_ha_state()
             return
 
         ds_state = self.hass.states.get(self._downstream)
@@ -372,6 +344,7 @@ class VirtualZoneClimate(ClimateEntity):
             _LOGGER.warning(
                 "Downstream climate %s unavailable; skipping tick", self._downstream
             )
+            self.async_write_ha_state()
             return
 
         allow_heat = self._attr_hvac_mode in (HVACMode.HEAT_COOL, HVACMode.HEAT)
@@ -383,7 +356,6 @@ class VirtualZoneClimate(ClimateEntity):
             await self._async_handle_room_sensor_lost(ds_state, allow_heat, allow_cool)
             return
 
-        # Room sensor is healthy again — clear the emergency flag if it was set.
         self._emergency_active = False
 
         desired: HVACMode | None = self._active_mode
@@ -409,14 +381,13 @@ class VirtualZoneClimate(ClimateEntity):
                 self._decision_reason = (
                     f"IDLE: room {room_temp:.1f}°F is inside target band "
                     f"{self._heat_target:.1f}–{self._cool_target:.1f}°F "
-                    f"(start thresholds "
-                    f"<{self._heat_target - self._deadband:.1f} or "
-                    f">{self._cool_target + self._deadband:.1f})"
+                    f"(start thresholds <{self._heat_target - self._deadband:.1f} "
+                    f"or >{self._cool_target + self._deadband:.1f})"
                 )
         else:
-            # Running: stop when we reach the target edge (no deadband on stop
-            # side — stops AT target, then waits min_cycle before restarting,
-            # which prevents short-cycling around the boundary).
+            # Running: stop when we reach the target edge. No deadband on the
+            # stop side — we stop AT the target and then min_cycle_time
+            # prevents immediate restart, which avoids short-cycling.
             if desired == HVACMode.COOL and room_temp <= self._cool_target:
                 desired = None
                 transition_reason = (
@@ -435,16 +406,10 @@ class VirtualZoneClimate(ClimateEntity):
             elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
             if elapsed < self._min_cycle:
                 remaining = int(self._min_cycle - elapsed)
-                _LOGGER.debug(
-                    "Min cycle time not elapsed (%.0fs < %ds), holding mode %s",
-                    elapsed,
-                    self._min_cycle,
-                    self._active_mode,
-                )
                 transition_reason = (
                     f"Min cycle hold: wanted to change to "
-                    f"{desired.value if desired else 'idle'} but "
-                    f"{remaining}s remain of min_cycle_time ({self._min_cycle}s)"
+                    f"{desired.value if desired else 'idle'} but {remaining}s "
+                    f"remain of min_cycle_time ({self._min_cycle}s)"
                 )
                 desired = self._active_mode
 
@@ -458,8 +423,8 @@ class VirtualZoneClimate(ClimateEntity):
                 self._last_pushed_setpoint = None
                 self._last_fan_tier = None
                 self._decision_reason = (
-                    (transition_reason or "Stopped")
-                    + f". Will stay off for at least {self._min_cycle}s."
+                    f"{transition_reason or 'Stopped'}. "
+                    f"Will stay off for at least {self._min_cycle}s."
                 )
                 self.async_write_ha_state()
                 return
@@ -472,13 +437,10 @@ class VirtualZoneClimate(ClimateEntity):
             self.async_write_ha_state()
             return
 
-        reason = await self._async_drive_downstream(
-            room_temp, self._active_mode, ds_state
+        reason = await self._async_drive_active(room_temp, self._active_mode, ds_state)
+        self._decision_reason = (
+            f"{transition_reason}. {reason}" if transition_reason else reason
         )
-        if transition_reason:
-            self._decision_reason = f"{transition_reason}. {reason}"
-        else:
-            self._decision_reason = reason
         self._attr_hvac_action = (
             HVACAction.COOLING
             if self._active_mode == HVACMode.COOL
@@ -486,30 +448,22 @@ class VirtualZoneClimate(ClimateEntity):
         )
         self.async_write_ha_state()
 
+    # ------------------------------------------------------------------ room sensor lost
+
     async def _async_handle_room_sensor_lost(
         self, ds_state: State, allow_heat: bool, allow_cool: bool
     ) -> None:
-        """Decide what to do when the room sensor is unavailable.
+        """Emergency fallback when the room sensor is unavailable."""
+        was_emergency = self._emergency_active
 
-        Behavior:
-          - If emergency mode is disabled, turn the downstream off (safe default)
-            rather than leaving it running blind.
-          - If emergency mode is enabled and an outdoor sensor is configured and
-            readable, drive heat/cool conservatively based on outdoor thresholds.
-          - Otherwise (no outdoor sensor or it's also dead), turn off.
-        """
         if not self._emergency_enable:
-            _LOGGER.warning(
-                "Source temp sensor %s unavailable and emergency mode disabled; "
-                "turning downstream off",
-                self._source_temp,
-            )
-            if self._active_mode is not None or self._emergency_active:
-                await self._async_stop_downstream()
-                self._active_mode = None
-                self._emergency_active = False
-                self._last_transition = dt_util.utcnow()
-            self._attr_hvac_action = HVACAction.IDLE
+            if not was_emergency and self._active_mode is not None:
+                _LOGGER.warning(
+                    "Source temp sensor %s unavailable and emergency mode "
+                    "disabled; turning downstream off",
+                    self._source_temp,
+                )
+            await self._async_go_idle()
             self._decision_reason = (
                 f"Room sensor {self._source_temp} unavailable and emergency "
                 "mode is disabled; downstream turned off for safety."
@@ -521,27 +475,22 @@ class VirtualZoneClimate(ClimateEntity):
         if self._outdoor_sensor:
             outdoor_temp = _as_float(self.hass.states.get(self._outdoor_sensor))
 
-        desired_mode: HVACMode | None = None
+        desired: HVACMode | None = None
         if outdoor_temp is not None:
             if allow_heat and outdoor_temp < self._emergency_heat_below:
-                desired_mode = HVACMode.HEAT
+                desired = HVACMode.HEAT
             elif allow_cool and outdoor_temp > self._emergency_cool_above:
-                desired_mode = HVACMode.COOL
+                desired = HVACMode.COOL
 
-        if desired_mode is None:
-            # Nothing to do — safe default is off.
-            _LOGGER.warning(
-                "Source temp sensor %s unavailable; emergency conditions not met "
-                "(outdoor=%s), turning downstream off",
-                self._source_temp,
-                outdoor_temp,
-            )
-            if self._active_mode is not None or self._emergency_active:
-                await self._async_stop_downstream()
-                self._active_mode = None
-                self._emergency_active = False
-                self._last_transition = dt_util.utcnow()
-            self._attr_hvac_action = HVACAction.IDLE
+        if desired is None:
+            if not was_emergency:
+                _LOGGER.warning(
+                    "Source temp sensor %s unavailable; emergency conditions "
+                    "not met (outdoor=%s), turning downstream off",
+                    self._source_temp,
+                    outdoor_temp,
+                )
+            await self._async_go_idle()
             outdoor_str = (
                 f"{outdoor_temp:.1f}°F" if outdoor_temp is not None else "unavailable"
             )
@@ -555,147 +504,110 @@ class VirtualZoneClimate(ClimateEntity):
             return
 
         # Apply min-cycle gate to emergency transitions too.
-        if desired_mode != self._active_mode and self._last_transition is not None:
+        if desired != self._active_mode and self._last_transition is not None:
             elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
             if elapsed < self._min_cycle:
-                _LOGGER.debug(
-                    "Emergency: min cycle not elapsed (%.0fs < %ds), holding",
-                    elapsed,
-                    self._min_cycle,
-                )
-                desired_mode = self._active_mode or desired_mode
+                desired = self._active_mode or desired
 
-        if desired_mode != self._active_mode:
-            self._active_mode = desired_mode
+        if desired != self._active_mode:
+            self._active_mode = desired
             self._last_transition = dt_util.utcnow()
 
         self._emergency_active = True
-        _LOGGER.warning(
-            "EMERGENCY mode active: room sensor %s unavailable, outdoor=%.1f, "
-            "driving downstream in %s",
-            self._source_temp,
-            outdoor_temp if outdoor_temp is not None else float("nan"),
-            desired_mode,
+        if not was_emergency:
+            _LOGGER.warning(
+                "EMERGENCY mode active: room sensor %s unavailable, "
+                "outdoor=%.1f, driving downstream in %s",
+                self._source_temp,
+                outdoor_temp if outdoor_temp is not None else float("nan"),
+                desired,
+            )
+
+        setpoint = (
+            self._emergency_cool_setpoint
+            if desired == HVACMode.COOL
+            else self._emergency_heat_setpoint
         )
-        if desired_mode == HVACMode.HEAT:
-            cmp_str = "<"
-            thresh = self._emergency_heat_below
-        else:
-            cmp_str = ">"
-            thresh = self._emergency_cool_above
+        await self._async_send(ds_state, desired, setpoint, self._emergency_fan_mode)
+
+        self._last_error = None
+        self._last_pushed_setpoint = setpoint
+        self._last_fan_tier = self._emergency_fan_mode
+
+        cmp_str = "<" if desired == HVACMode.HEAT else ">"
+        thresh = (
+            self._emergency_heat_below
+            if desired == HVACMode.HEAT
+            else self._emergency_cool_above
+        )
         self._decision_reason = (
-            f"EMERGENCY {desired_mode.value.upper()}: room sensor "
+            f"EMERGENCY {desired.value.upper()}: room sensor "
             f"{self._source_temp} unavailable, outdoor {outdoor_temp:.1f}°F "
             f"{cmp_str} threshold {thresh:.0f}°F. "
             "Driving downstream at fixed emergency setpoint."
         )
 
-        await self._async_drive_emergency(desired_mode, ds_state)
         self._attr_hvac_action = (
-            HVACAction.COOLING
-            if desired_mode == HVACMode.COOL
-            else HVACAction.HEATING
+            HVACAction.COOLING if desired == HVACMode.COOL else HVACAction.HEATING
         )
         self.async_write_ha_state()
 
-    async def _async_drive_emergency(
-        self, mode: HVACMode, ds_state: State
-    ) -> None:
-        """Command the downstream with fixed emergency setpoint + fan mode."""
-        try:
-            ds_min = float(ds_state.attributes.get("min_temp", 60))
-            ds_max = float(ds_state.attributes.get("max_temp", 90))
-            ds_step = float(ds_state.attributes.get("target_temp_step", 1))
-        except (TypeError, ValueError):
-            ds_min, ds_max, ds_step = 60.0, 90.0, 1.0
+    # ------------------------------------------------------------------ downstream drive
 
-        if mode == HVACMode.COOL:
-            desired_hvac = "cool"
-            raw_setpoint = self._emergency_cool_setpoint
-        else:
-            desired_hvac = "heat"
-            raw_setpoint = self._emergency_heat_setpoint
-
-        setpoint = max(ds_min, min(ds_max, raw_setpoint))
-        if ds_step > 0:
-            setpoint = round(setpoint / ds_step) * ds_step
-
-        available_fan = ds_state.attributes.get("fan_modes") or []
-        fan_mode: str | None = (
-            self._emergency_fan_mode
-            if self._emergency_fan_mode in available_fan
-            else (available_fan[0] if available_fan else None)
-        )
-
-        cur_mode = ds_state.state
-        cur_setpoint = ds_state.attributes.get("temperature")
-        cur_fan = ds_state.attributes.get("fan_mode")
-
-        if cur_mode != desired_hvac and self._last_sent.get("hvac_mode") != desired_hvac:
-            await self.hass.services.async_call(
-                "climate",
-                "set_hvac_mode",
-                {"entity_id": self._downstream, "hvac_mode": desired_hvac},
-                blocking=True,
-            )
-            self._last_sent["hvac_mode"] = desired_hvac
-
-        if (
-            cur_setpoint != setpoint
-            and self._last_sent.get("setpoint") != setpoint
-        ):
-            await self.hass.services.async_call(
-                "climate",
-                "set_temperature",
-                {"entity_id": self._downstream, "temperature": setpoint},
-                blocking=True,
-            )
-            self._last_sent["setpoint"] = setpoint
-
-        if fan_mode and cur_fan != fan_mode and self._last_sent.get("fan_mode") != fan_mode:
-            await self.hass.services.async_call(
-                "climate",
-                "set_fan_mode",
-                {"entity_id": self._downstream, "fan_mode": fan_mode},
-                blocking=True,
-            )
-            self._last_sent["fan_mode"] = fan_mode
-            self._attr_fan_mode = fan_mode
-
-    async def _async_drive_downstream(
+    async def _async_drive_active(
         self, room_temp: float, mode: HVACMode, ds_state: State
     ) -> str:
-        try:
-            ds_min = float(ds_state.attributes.get("min_temp", 60))
-            ds_max = float(ds_state.attributes.get("max_temp", 90))
-            ds_step = float(ds_state.attributes.get("target_temp_step", 1))
-        except (TypeError, ValueError):
-            ds_min, ds_max, ds_step = 60.0, 90.0, 1.0
+        """Compute and send a normal (sensor-driven) downstream command."""
+        ds_min, ds_max, ds_step = self._downstream_limits(ds_state)
 
         if mode == HVACMode.COOL:
             raw_setpoint = self._cool_target - self._offset
             error = max(0.0, room_temp - self._cool_target)
-            desired_hvac = "cool"
         else:
             raw_setpoint = self._heat_target + self._offset
             error = max(0.0, self._heat_target - room_temp)
-            desired_hvac = "heat"
 
-        setpoint = max(ds_min, min(ds_max, raw_setpoint))
-        if ds_step > 0:
-            setpoint = round(setpoint / ds_step) * ds_step
-
-        available_fan = ds_state.attributes.get("fan_modes") or []
+        setpoint = self._clamp(raw_setpoint, ds_min, ds_max, ds_step)
+        available_fan = ds_state.attributes.get(ATTR_FAN_MODES) or []
         fan_mode = self._pick_fan_mode(error, available_fan)
+
         self._last_error = error
         self._last_pushed_setpoint = setpoint
         self._last_fan_tier = fan_mode
 
-        cur_mode = ds_state.state
-        cur_setpoint = ds_state.attributes.get("temperature")
-        cur_fan = ds_state.attributes.get("fan_mode")
+        await self._async_send(ds_state, mode, setpoint, fan_mode)
 
-        # Only resend changes, to avoid hammering esphome / the unit.
+        if mode == HVACMode.COOL:
+            target_label = f"cool_target {self._cool_target:.1f}°F"
+            stop_label = f"will stop at {self._cool_target:.1f}°F"
+            offset_sign = "−"
+        else:
+            target_label = f"heat_target {self._heat_target:.1f}°F"
+            stop_label = f"will stop at {self._heat_target:.1f}°F"
+            offset_sign = "+"
+
+        return (
+            f"{mode.value.upper()}ING: room {room_temp:.1f}°F, {target_label}, "
+            f"error {error:.1f}°F. Pushing downstream setpoint to "
+            f"{setpoint:.0f}°F (target {offset_sign} {self._offset:.0f}°F offset, "
+            f"clamped to {ds_min:.0f}–{ds_max:.0f}). "
+            f"Fan tier: {fan_mode or 'n/a'}. {stop_label}."
+        )
+
+    async def _async_send(
+        self,
+        ds_state: State,
+        mode: HVACMode,
+        setpoint: float,
+        fan_mode: str | None,
+    ) -> None:
+        """Send hvac_mode/setpoint/fan_mode to the downstream, deduped."""
+        desired_hvac = mode.value  # "heat" / "cool"
+
+        cur_mode = ds_state.state
+        cur_setpoint = ds_state.attributes.get(ATTR_TEMPERATURE)
+        cur_fan = ds_state.attributes.get(ATTR_FAN_MODE)
+
         if cur_mode != desired_hvac and self._last_sent.get("hvac_mode") != desired_hvac:
             await self.hass.services.async_call(
                 "climate",
@@ -705,10 +617,7 @@ class VirtualZoneClimate(ClimateEntity):
             )
             self._last_sent["hvac_mode"] = desired_hvac
 
-        if (
-            cur_setpoint != setpoint
-            and self._last_sent.get("setpoint") != setpoint
-        ):
+        if cur_setpoint != setpoint and self._last_sent.get("setpoint") != setpoint:
             await self.hass.services.async_call(
                 "climate",
                 "set_temperature",
@@ -716,6 +625,10 @@ class VirtualZoneClimate(ClimateEntity):
                 blocking=True,
             )
             self._last_sent["setpoint"] = setpoint
+
+        available_fan = ds_state.attributes.get(ATTR_FAN_MODES) or []
+        if fan_mode and fan_mode not in available_fan:
+            fan_mode = available_fan[0] if available_fan else None
 
         if fan_mode and cur_fan != fan_mode and self._last_sent.get("fan_mode") != fan_mode:
             await self.hass.services.async_call(
@@ -727,34 +640,17 @@ class VirtualZoneClimate(ClimateEntity):
             self._last_sent["fan_mode"] = fan_mode
             self._attr_fan_mode = fan_mode
 
-        if mode == HVACMode.COOL:
-            target_label = f"cool_target {self._cool_target:.1f}°F"
-            stop_label = f"will stop at {self._cool_target:.1f}°F"
-        else:
-            target_label = f"heat_target {self._heat_target:.1f}°F"
-            stop_label = f"will stop at {self._heat_target:.1f}°F"
-
-        return (
-            f"{desired_hvac.upper()}ING: room {room_temp:.1f}°F, {target_label}, "
-            f"error {error:.1f}°F. Pushing downstream setpoint to "
-            f"{setpoint:.0f}°F (target {'−' if mode == HVACMode.COOL else '+'} "
-            f"{self._offset:.0f}°F offset, clamped to {ds_min:.0f}–{ds_max:.0f}). "
-            f"Fan tier: {fan_mode or 'n/a'}. {stop_label}."
-        )
-
-    def _pick_fan_mode(self, error: float, available: list[str]) -> str | None:
-        if not available:
-            return None
-        tiers = sorted(self._fan_tiers or [], key=lambda t: float(t["max_error"]))
-        # First tier whose max_error >= current error AND whose fan_mode exists downstream.
-        for tier in tiers:
-            if error <= float(tier["max_error"]) and tier["fan_mode"] in available:
-                return tier["fan_mode"]
-        # Fall back to the highest-configured tier that the downstream actually supports.
-        for tier in reversed(tiers):
-            if tier["fan_mode"] in available:
-                return tier["fan_mode"]
-        return available[0]
+    async def _async_go_idle(self) -> None:
+        """Stop downstream and clear active state."""
+        if self._active_mode is not None or self._emergency_active:
+            await self._async_stop_downstream()
+            self._active_mode = None
+            self._emergency_active = False
+            self._last_transition = dt_util.utcnow()
+        self._attr_hvac_action = HVACAction.IDLE
+        self._last_error = 0.0
+        self._last_pushed_setpoint = None
+        self._last_fan_tier = None
 
     async def _async_stop_downstream(self) -> None:
         await self.hass.services.async_call(
@@ -764,3 +660,41 @@ class VirtualZoneClimate(ClimateEntity):
             blocking=True,
         )
         self._last_sent = {"hvac_mode": "off"}
+
+    # ------------------------------------------------------------------ helpers
+
+    def _pick_fan_mode(self, error: float, available: list[str]) -> str | None:
+        if not available:
+            return None
+        for tier in self._fan_tiers:
+            if error <= tier["max_error"] and tier["fan_mode"] in available:
+                return tier["fan_mode"]
+        for tier in reversed(self._fan_tiers):
+            if tier["fan_mode"] in available:
+                return tier["fan_mode"]
+        return available[0]
+
+    def _downstream_limits(
+        self, ds_state: State | None = None
+    ) -> tuple[float, float, float]:
+        """Return (min_temp, max_temp, step) from the downstream, with fallbacks."""
+        if ds_state is None:
+            ds_state = self.hass.states.get(self._downstream)
+        default = (45.0, 95.0, 1.0)
+        if ds_state is None:
+            return default
+        try:
+            return (
+                float(ds_state.attributes.get(ATTR_MIN_TEMP, default[0])),
+                float(ds_state.attributes.get(ATTR_MAX_TEMP, default[1])),
+                float(ds_state.attributes.get(ATTR_TARGET_TEMP_STEP, default[2])),
+            )
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float, step: float) -> float:
+        value = max(low, min(high, value))
+        if step > 0:
+            value = round(value / step) * step
+        return value

@@ -2,10 +2,10 @@
   "config": {
     "step": {
       "user": {
-        "title": "Climate Optimizer Zone",
+        "title": "Virtual Climate Device",
         "description": "Create a virtual climate entity that uses a room sensor to control a downstream mini split.",
         "data": {
-          "name": "Zone name",
+          "name": "Virtual Climate Device Name",
           "source_temp_sensor": "Room temperature sensor",
           "source_humidity_sensor": "Room humidity sensor (optional)",
           "downstream_climate": "Downstream climate entity (the mini split)",

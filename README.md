@@ -1,91 +1,98 @@
 # Climate Optimizer
 
-A Home Assistant custom integration that wraps a "dumb" climate device (e.g. a minisplit exposed via the ESPHome `aux_ac` or `midea` components) with a virtual climate entity driven by an external temperature/humidity sensor in the same room.
+A Home Assistant custom integration that wraps a "dumb" climate device (such as a mini split with an unreliable or poorly located internal sensor) with a **virtual climate entity** driven by an external temperature/humidity sensor in the same room.
 
-## Why
+Each virtual climate device pairs one room sensor with one downstream climate entity and runs its own control loop, so you can get tight room-level behavior out of equipment that would otherwise let temperature drift or idle its indoor fan 24/7.
 
-Minisplits in `auto` / `heat_cool` mode often:
+## What it does
 
-- Let the room drift several degrees before reacting, because the unit's internal sensor is near the ceiling / in a corner and lags the actual room temperature.
-- Sit there running the indoor fan on low 24/7 even when no temperature change is happening.
+For every virtual climate device you create, the integration:
 
-This integration gives you a *virtual* climate entity per zone. You pick:
+- Reads a **room temperature sensor** you pick (and optionally a humidity sensor for display).
+- Watches a **target range** with a configurable hysteresis deadband.
+- Drives a **downstream climate entity** (the real mini split) to hit that range.
+- Picks a **fan mode** based on how far the room is from the target band.
+- Turns the downstream unit **fully off** once the room is back in range — no idling fan.
+- Respects a **minimum cycle time** between transitions to protect the compressor.
+- Falls back to a conservative **emergency mode** if the room sensor goes offline, optionally gated by an outdoor temperature sensor, to protect the room (and your pipes) until the sensor comes back.
 
-- a **room temperature sensor** (e.g. an Xsense / thermo-hygrometer entity)
-- the **downstream climate entity** (the minisplit)
-- a **target range** (heat target + cool target with a small hysteresis deadband)
+The virtual entity exposes a `decision_reason` attribute so you can see, at a glance, why it is doing whatever it is doing.
 
-The virtual entity runs a simple bang-bang state machine with the following behavior:
+## How the control loop works
 
-- When the room is *above* `cool_target + deadband`: put the downstream in `cool`, push its setpoint `offset` degrees **below** your cool target (e.g. cool target 70 → minisplit setpoint 66) so it actually runs instead of thinking it's already at temp, and pick a fan mode based on how far out of range we are.
-- When the room is *below* `heat_target - deadband`: mirror image for heat.
-- When the room re-enters the target band: turn the downstream **off** (so you don't have the indoor fan running 24/7), and wait `min_cycle_time` before starting another cycle.
+The state machine is intentionally simple and uses asymmetric hysteresis to avoid short cycling:
 
-## Install (local / development)
+- **Start cooling** when the room climbs to `cool_target + deadband`. Command the downstream unit to `cool` with a setpoint pushed `setpoint_offset` degrees **below** the cool target, so the unit actually runs instead of thinking it is already at temperature.
+- **Start heating** when the room drops to `heat_target - deadband`. Mirror image: command `heat` with a setpoint pushed `setpoint_offset` degrees **above** the heat target.
+- **Stop** (turn the downstream unit fully off) when the room re-enters the target band exactly, then wait `min_cycle_time` before another transition is allowed.
+- On every tick, the commanded fan mode is re-evaluated based on the current error from the target band and the configured fan tiers.
 
-1. Copy `custom_components/climate_optimizer` into your HA config directory:
-   ```
-   config/custom_components/climate_optimizer/
-   ```
-2. Restart Home Assistant.
-3. **Settings → Devices & Services → Add Integration → Climate Optimizer**.
-4. Fill in the zone name, room sensor, downstream climate, and target range.
-
-Each zone is a separate config entry, so add one per minisplit.
+Downstream commands are de-duplicated — the integration only resends mode/setpoint/fan changes when they actually differ from the downstream entity's current state.
 
 ## Configuration options
 
+All fields are set in the UI when you add the integration, and every numeric field is editable later via **Configure** on the integration entry.
+
 | Field | Meaning | Default |
 | --- | --- | --- |
-| Zone name | Name for the virtual climate entity | — |
+| Virtual Climate Device Name | Name for the virtual climate entity | — |
 | Room temperature sensor | Temperature sensor to read | — |
-| Room humidity sensor | Optional, used for display/logging | — |
-| Downstream climate entity | The real minisplit to command | — |
+| Room humidity sensor | Optional, used for display | — |
+| Downstream climate entity | The real mini split to command | — |
+| Area | Optional area assignment for the device | — |
 | Heat target | Below this, start heating (°F) | 65 |
 | Cool target | Above this, start cooling (°F) | 70 |
 | Deadband | Hysteresis before starting a cycle (°F) | 0.5 |
-| Setpoint offset | Degrees past the target to push the minisplit's own setpoint | 4 |
+| Setpoint offset | Degrees past the target to push the downstream setpoint | 4 |
 | Minimum cycle time | Seconds to wait between transitions | 300 |
-| Control loop interval | Safety-net tick in addition to sensor updates | 30 |
-
-You can tune all numeric fields later without re-adding the entry via **Configure** on the integration entry.
+| Control loop interval | Safety-net tick in addition to sensor updates (s) | 30 |
 
 ## Fan tiering
 
-The integration picks the downstream fan mode based on how far out of the target band you are. The default tiers (configured in `const.py` for now) are:
+The integration maps "how far out of the target band are we" to a downstream fan mode. Four tiers are configurable directly in the UI, each a `(max_error, fan_mode)` pair. Defaults:
 
 | Error from target band | Fan mode |
 | --- | --- |
 | ≤ 1°F | `low` |
 | ≤ 3°F | `medium` |
 | ≤ 5°F | `high` |
-| > 5°F | `turbo` |
+| everything else | `turbo` |
 
-If a tier's fan_mode isn't available on the downstream unit, the integration falls back to the nearest supported mode. Arbitrary fan_mode strings are supported, so this should work with future units that expose different fan names.
+Fan mode names are free-form strings, so any downstream unit's naming works. If the exact mode name isn't supported by the downstream entity, the integration falls back to the nearest available mode.
 
-## Safety & emergency fallback
+## Emergency fallback
 
-- If the downstream unit becomes unavailable, the integration skips that tick and retries later.
-- Downstream commands are de-duped so nothing is resent if the unit is already in the desired state.
-- The minimum cycle time protects the compressor from rapid on/off cycling.
+When the room sensor becomes `unknown` or `unavailable`, the integration has two possible behaviors:
 
-When the **room sensor** becomes unknown/unavailable, you have two behaviors:
+1. **Disabled** — the downstream unit is turned off. Safer than running blind.
+2. **Enabled (default)** — the integration consults an optional outdoor temperature sensor. If the outdoor temperature is outside a configured safe band, it forces heat or cool at a conservative fixed setpoint and fan mode until the room sensor recovers. If no outdoor sensor is configured (or it is also unavailable), the downstream unit is turned off.
 
-1. **Emergency fallback disabled** — the downstream unit is turned off (safer than running blind).
-2. **Emergency fallback enabled** (default) — the integration consults an optional **outdoor temperature sensor** and, if the outdoor temperature is outside the configured safe band, forces heat or cool at a conservative fixed setpoint using a conservative fan mode. This is intended to keep pipes from freezing (and, symmetrically, keep the room from cooking) even if the room sensor has fallen off the network.
+Defaults:
 
-  Defaults:
-  - Force heat when outdoor < **35°F**, at a setpoint of **62°F** on `low` fan
-  - Force cool when outdoor > **95°F**, at a setpoint of **80°F** on `low` fan
+- Force heat when outdoor is below **35°F**, at a setpoint of **62°F** on `low` fan
+- Force cool when outdoor is above **95°F**, at a setpoint of **80°F** on `low` fan
 
-  If no outdoor sensor is configured (or it is also unavailable), the unit is turned off — the integration never runs blind. Emergency mode still respects the virtual entity's `hvac_mode` (e.g. if you set it to `heat`, it will not emergency-cool).
+Emergency mode still respects the virtual entity's current `hvac_mode` — if you've set it to `heat_only`, it won't emergency-cool you.
 
-An `emergency_active` attribute on the virtual entity tells you when this is engaged, and the HA log will show a warning explaining why.
+An `emergency_active` attribute is exposed on the virtual entity, and a warning is logged when emergency mode engages or disengages.
 
 ## Control source
 
-The virtual entity is intended to be the **only** way the downstream unit is controlled. The integration will happily overwrite any changes made directly to the downstream climate entity on the next tick; treat the downstream as an implementation detail and drive everything through the virtual entity.
+The virtual climate entity is intended to be the **only** thing driving the downstream unit. Any changes made directly to the downstream climate entity will be overwritten on the next tick. Treat the downstream entity as an implementation detail and drive everything through the virtual entity.
 
-## Status
+## Installation
 
-v0.1 — runs locally, has not been published to HACS yet.
+This integration is distributed via [HACS](https://hacs.xyz/) as a custom repository:
+
+1. In Home Assistant, open **HACS → Integrations**.
+2. From the menu, choose **Custom repositories**.
+3. Add `https://github.com/jasongill/ha-climate-optimizer` with category **Integration**.
+4. Install **Climate Optimizer** from the HACS list and restart Home Assistant.
+5. Go to **Settings → Devices & Services → Add Integration** and search for **Climate Optimizer**.
+6. Create one virtual climate device per room/mini split pair.
+
+## Requirements
+
+- Home Assistant **2026.3** or newer.
+- A downstream `climate` entity that supports `heat`, `cool`, `off`, a `target_temperature`, and one or more `fan_modes`.
+- A `sensor` entity reporting room temperature (device_class `temperature`). Humidity and outdoor temperature sensors are optional.
