@@ -21,6 +21,8 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import Event, HomeAssistant, State, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_track_state_change_event,
@@ -29,6 +31,7 @@ from homeassistant.helpers.event import (
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_AREA_ID,
     CONF_COOL_TARGET,
     CONF_DEADBAND,
     CONF_DOWNSTREAM_CLIMATE,
@@ -103,6 +106,13 @@ class VirtualZoneClimate(ClimateEntity):
 
         self._attr_name = cfg[CONF_NAME]
         self._attr_unique_id = f"{entry.entry_id}_zone_climate"
+        self._area_id: str | None = cfg.get(CONF_AREA_ID)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=cfg[CONF_NAME],
+            manufacturer="Climate Optimizer",
+            model="Virtual Zone",
+        )
 
         self._source_temp: str = cfg[CONF_SOURCE_TEMP_SENSOR]
         self._source_humidity: str | None = cfg.get(CONF_SOURCE_HUMIDITY_SENSOR)
@@ -153,6 +163,15 @@ class VirtualZoneClimate(ClimateEntity):
         self._last_transition: datetime | None = None
         self._last_sent: dict[str, Any] = {}
 
+        # Human-readable explanation of what the state machine last decided,
+        # plus the numeric details that drove the decision. Exposed as
+        # entity attributes so the user can understand what's happening.
+        self._decision_reason: str = "Starting up"
+        self._last_room_temp: float | None = None
+        self._last_error: float | None = None
+        self._last_pushed_setpoint: float | None = None
+        self._last_fan_tier: str | None = None
+
     # ------------------------------------------------------------------ lifecycle
 
     async def async_added_to_hass(self) -> None:
@@ -176,6 +195,17 @@ class VirtualZoneClimate(ClimateEntity):
                 timedelta(seconds=self._tick_interval),
             )
         )
+
+        # If the user picked an area in the config flow, assign it on the
+        # device registry entry so it shows up in the room's UI card.
+        if self._area_id:
+            dev_reg = dr.async_get(self.hass)
+            device = dev_reg.async_get_device(
+                identifiers={(DOMAIN, self._entry.entry_id)}
+            )
+            if device is not None and device.area_id != self._area_id:
+                dev_reg.async_update_device(device.id, area_id=self._area_id)
+
         self.hass.async_create_task(self._async_control())
 
     # ------------------------------------------------------------------ properties
@@ -228,9 +258,16 @@ class VirtualZoneClimate(ClimateEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
+            "decision_reason": self._decision_reason,
             "active_mode": self._active_mode.value if self._active_mode else None,
-            "setpoint_offset": self._offset,
+            "room_temperature": self._last_room_temp,
+            "heat_target": self._heat_target,
+            "cool_target": self._cool_target,
             "deadband": self._deadband,
+            "error_from_band": self._last_error,
+            "pushed_setpoint": self._last_pushed_setpoint,
+            "active_fan_tier": self._last_fan_tier,
+            "setpoint_offset": self._offset,
             "fan_tiers": self._fan_tiers,
             "source_temp_sensor": self._source_temp,
             "source_humidity_sensor": self._source_humidity,
@@ -324,10 +361,14 @@ class VirtualZoneClimate(ClimateEntity):
 
     async def _async_control(self) -> None:
         if self._attr_hvac_mode == HVACMode.OFF:
+            self._decision_reason = "Virtual entity is OFF"
             return
 
         ds_state = self.hass.states.get(self._downstream)
         if ds_state is None or ds_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            self._decision_reason = (
+                f"Downstream climate {self._downstream} unavailable; holding"
+            )
             _LOGGER.warning(
                 "Downstream climate %s unavailable; skipping tick", self._downstream
             )
@@ -337,6 +378,7 @@ class VirtualZoneClimate(ClimateEntity):
         allow_cool = self._attr_hvac_mode in (HVACMode.HEAT_COOL, HVACMode.COOL)
 
         room_temp = self.current_temperature
+        self._last_room_temp = room_temp
         if room_temp is None:
             await self._async_handle_room_sensor_lost(ds_state, allow_heat, allow_cool)
             return
@@ -345,30 +387,64 @@ class VirtualZoneClimate(ClimateEntity):
         self._emergency_active = False
 
         desired: HVACMode | None = self._active_mode
+        transition_reason: str | None = None
 
         if desired is None:
             # Idle: decide whether to start a cycle.
             if allow_cool and room_temp > self._cool_target + self._deadband:
                 desired = HVACMode.COOL
+                transition_reason = (
+                    f"Starting COOL: room {room_temp:.1f}°F > cool_target + deadband "
+                    f"({self._cool_target:.1f} + {self._deadband:.1f} = "
+                    f"{self._cool_target + self._deadband:.1f}°F)"
+                )
             elif allow_heat and room_temp < self._heat_target - self._deadband:
                 desired = HVACMode.HEAT
+                transition_reason = (
+                    f"Starting HEAT: room {room_temp:.1f}°F < heat_target − deadband "
+                    f"({self._heat_target:.1f} − {self._deadband:.1f} = "
+                    f"{self._heat_target - self._deadband:.1f}°F)"
+                )
+            else:
+                self._decision_reason = (
+                    f"IDLE: room {room_temp:.1f}°F is inside target band "
+                    f"{self._heat_target:.1f}–{self._cool_target:.1f}°F "
+                    f"(start thresholds "
+                    f"<{self._heat_target - self._deadband:.1f} or "
+                    f">{self._cool_target + self._deadband:.1f})"
+                )
         else:
-            # Running: stop when we reach the target edge (no deadband here — we
-            # want to stop *at* the target, then wait min_cycle before restarting).
+            # Running: stop when we reach the target edge (no deadband on stop
+            # side — stops AT target, then waits min_cycle before restarting,
+            # which prevents short-cycling around the boundary).
             if desired == HVACMode.COOL and room_temp <= self._cool_target:
                 desired = None
+                transition_reason = (
+                    f"Ending COOL: room {room_temp:.1f}°F reached cool_target "
+                    f"{self._cool_target:.1f}°F"
+                )
             elif desired == HVACMode.HEAT and room_temp >= self._heat_target:
                 desired = None
+                transition_reason = (
+                    f"Ending HEAT: room {room_temp:.1f}°F reached heat_target "
+                    f"{self._heat_target:.1f}°F"
+                )
 
         # Minimum cycle time gate on transitions.
         if desired != self._active_mode and self._last_transition is not None:
             elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
             if elapsed < self._min_cycle:
+                remaining = int(self._min_cycle - elapsed)
                 _LOGGER.debug(
                     "Min cycle time not elapsed (%.0fs < %ds), holding mode %s",
                     elapsed,
                     self._min_cycle,
                     self._active_mode,
+                )
+                transition_reason = (
+                    f"Min cycle hold: wanted to change to "
+                    f"{desired.value if desired else 'idle'} but "
+                    f"{remaining}s remain of min_cycle_time ({self._min_cycle}s)"
                 )
                 desired = self._active_mode
 
@@ -378,15 +454,31 @@ class VirtualZoneClimate(ClimateEntity):
             if desired is None:
                 await self._async_stop_downstream()
                 self._attr_hvac_action = HVACAction.IDLE
+                self._last_error = 0.0
+                self._last_pushed_setpoint = None
+                self._last_fan_tier = None
+                self._decision_reason = (
+                    (transition_reason or "Stopped")
+                    + f". Will stay off for at least {self._min_cycle}s."
+                )
                 self.async_write_ha_state()
                 return
 
         if self._active_mode is None:
             self._attr_hvac_action = HVACAction.IDLE
+            self._last_error = 0.0
+            self._last_pushed_setpoint = None
+            self._last_fan_tier = None
             self.async_write_ha_state()
             return
 
-        await self._async_drive_downstream(room_temp, self._active_mode, ds_state)
+        reason = await self._async_drive_downstream(
+            room_temp, self._active_mode, ds_state
+        )
+        if transition_reason:
+            self._decision_reason = f"{transition_reason}. {reason}"
+        else:
+            self._decision_reason = reason
         self._attr_hvac_action = (
             HVACAction.COOLING
             if self._active_mode == HVACMode.COOL
@@ -418,6 +510,10 @@ class VirtualZoneClimate(ClimateEntity):
                 self._emergency_active = False
                 self._last_transition = dt_util.utcnow()
             self._attr_hvac_action = HVACAction.IDLE
+            self._decision_reason = (
+                f"Room sensor {self._source_temp} unavailable and emergency "
+                "mode is disabled; downstream turned off for safety."
+            )
             self.async_write_ha_state()
             return
 
@@ -446,6 +542,15 @@ class VirtualZoneClimate(ClimateEntity):
                 self._emergency_active = False
                 self._last_transition = dt_util.utcnow()
             self._attr_hvac_action = HVACAction.IDLE
+            outdoor_str = (
+                f"{outdoor_temp:.1f}°F" if outdoor_temp is not None else "unavailable"
+            )
+            self._decision_reason = (
+                f"EMERGENCY STANDBY: room sensor {self._source_temp} "
+                f"unavailable, outdoor {outdoor_str}. Within safe band "
+                f"({self._emergency_heat_below:.0f}–"
+                f"{self._emergency_cool_above:.0f}°F), downstream off."
+            )
             self.async_write_ha_state()
             return
 
@@ -471,6 +576,18 @@ class VirtualZoneClimate(ClimateEntity):
             self._source_temp,
             outdoor_temp if outdoor_temp is not None else float("nan"),
             desired_mode,
+        )
+        if desired_mode == HVACMode.HEAT:
+            cmp_str = "<"
+            thresh = self._emergency_heat_below
+        else:
+            cmp_str = ">"
+            thresh = self._emergency_cool_above
+        self._decision_reason = (
+            f"EMERGENCY {desired_mode.value.upper()}: room sensor "
+            f"{self._source_temp} unavailable, outdoor {outdoor_temp:.1f}°F "
+            f"{cmp_str} threshold {thresh:.0f}°F. "
+            "Driving downstream at fixed emergency setpoint."
         )
 
         await self._async_drive_emergency(desired_mode, ds_state)
@@ -547,7 +664,7 @@ class VirtualZoneClimate(ClimateEntity):
 
     async def _async_drive_downstream(
         self, room_temp: float, mode: HVACMode, ds_state: State
-    ) -> None:
+    ) -> str:
         try:
             ds_min = float(ds_state.attributes.get("min_temp", 60))
             ds_max = float(ds_state.attributes.get("max_temp", 90))
@@ -570,6 +687,9 @@ class VirtualZoneClimate(ClimateEntity):
 
         available_fan = ds_state.attributes.get("fan_modes") or []
         fan_mode = self._pick_fan_mode(error, available_fan)
+        self._last_error = error
+        self._last_pushed_setpoint = setpoint
+        self._last_fan_tier = fan_mode
 
         cur_mode = ds_state.state
         cur_setpoint = ds_state.attributes.get("temperature")
@@ -606,6 +726,21 @@ class VirtualZoneClimate(ClimateEntity):
             )
             self._last_sent["fan_mode"] = fan_mode
             self._attr_fan_mode = fan_mode
+
+        if mode == HVACMode.COOL:
+            target_label = f"cool_target {self._cool_target:.1f}°F"
+            stop_label = f"will stop at {self._cool_target:.1f}°F"
+        else:
+            target_label = f"heat_target {self._heat_target:.1f}°F"
+            stop_label = f"will stop at {self._heat_target:.1f}°F"
+
+        return (
+            f"{desired_hvac.upper()}ING: room {room_temp:.1f}°F, {target_label}, "
+            f"error {error:.1f}°F. Pushing downstream setpoint to "
+            f"{setpoint:.0f}°F (target {'−' if mode == HVACMode.COOL else '+'} "
+            f"{self._offset:.0f}°F offset, clamped to {ds_min:.0f}–{ds_max:.0f}). "
+            f"Fan tier: {fan_mode or 'n/a'}. {stop_label}."
+        )
 
     def _pick_fan_mode(self, error: float, available: list[str]) -> str | None:
         if not available:

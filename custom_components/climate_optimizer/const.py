@@ -22,6 +22,28 @@ CONF_EMERGENCY_HEAT_SETPOINT = "emergency_heat_setpoint"
 CONF_EMERGENCY_COOL_SETPOINT = "emergency_cool_setpoint"
 CONF_EMERGENCY_FAN_MODE = "emergency_fan_mode"
 
+CONF_AREA_ID = "area_id"
+
+# Fan tiers are stored in the entry both as the legacy "fan_tiers" list AND as
+# four flat (error, mode) pairs so they can be edited in the UI config flow.
+CONF_FAN_TIER_1_ERROR = "fan_tier_1_error"
+CONF_FAN_TIER_1_MODE = "fan_tier_1_mode"
+CONF_FAN_TIER_2_ERROR = "fan_tier_2_error"
+CONF_FAN_TIER_2_MODE = "fan_tier_2_mode"
+CONF_FAN_TIER_3_ERROR = "fan_tier_3_error"
+CONF_FAN_TIER_3_MODE = "fan_tier_3_mode"
+CONF_FAN_TIER_4_ERROR = "fan_tier_4_error"
+CONF_FAN_TIER_4_MODE = "fan_tier_4_mode"
+
+DEFAULT_FAN_TIER_1_ERROR = 1.0
+DEFAULT_FAN_TIER_1_MODE = "low"
+DEFAULT_FAN_TIER_2_ERROR = 3.0
+DEFAULT_FAN_TIER_2_MODE = "medium"
+DEFAULT_FAN_TIER_3_ERROR = 5.0
+DEFAULT_FAN_TIER_3_MODE = "high"
+DEFAULT_FAN_TIER_4_ERROR = 999.0
+DEFAULT_FAN_TIER_4_MODE = "turbo"
+
 DEFAULT_HEAT_TARGET = 65.0
 DEFAULT_COOL_TARGET = 70.0
 DEFAULT_DEADBAND = 0.5
