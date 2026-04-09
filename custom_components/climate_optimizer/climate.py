@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -364,9 +365,98 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         ds = self.hass.states.get(self._downstream)
         return ds.attributes.get(ATTR_FAN_MODES) if ds is not None else None
 
+    def _compute_short_status(self) -> tuple[str, str]:
+        """Return (status_text, mdi_icon) for the companion sensor.
+
+        Designed to fit on a single dashboard line. Order matters: most
+        specific / most actionable conditions win. All inputs are already
+        tracked on self, so this is a pure derivation.
+        """
+        if self._attr_hvac_mode == HVACMode.OFF:
+            return "Off", "mdi:power"
+        if self._emergency_active:
+            return "Emergency (sensor lost)", "mdi:alert"
+
+        room = self._last_room_temp
+        if room is None:
+            return "Waiting for room sensor", "mdi:thermometer-off"
+
+        reason = self._decision_reason or ""
+        if reason.startswith("Min cycle hold"):
+            m = re.search(r"(\d+)s remain", reason)
+            text = (
+                f"Holding {m.group(1)}s (compressor protection)"
+                if m
+                else "Holding (compressor protection)"
+            )
+            return text, "mdi:timer-sand"
+
+        active = self._active_mode
+        if active in (HVACMode.HEAT, HVACMode.COOL):
+            if active == HVACMode.HEAT:
+                target = self._heat_target + self._overshoot[HVACMode.HEAT]
+                bits = [f"Heating → {target:.0f}°F"]
+                icon = "mdi:fire"
+            else:
+                target = self._cool_target - self._overshoot[HVACMode.COOL]
+                bits = [f"Cooling → {target:.0f}°F"]
+                icon = "mdi:snowflake"
+            extras: list[str] = []
+            if self._setpoint_boost:
+                extras.append(f"+{self._setpoint_boost:.0f}° push")
+            if self._fan_boost:
+                extras.append(f"fan+{self._fan_boost}")
+            if self._ds_stale:
+                extras.append("ds sensor stale")
+            if extras:
+                bits.append("(" + ", ".join(extras) + ")")
+                # Stalled-and-pushing gets a distinctive icon so it stands
+                # out from a normal cycle on the dashboard.
+                icon = "mdi:rocket-launch"
+            return " ".join(bits), icon
+
+        # Idle inside the deadband — show how close we are to either edge
+        # so the user can see the system is "watching" rather than asleep.
+        near = 1.0
+        if room <= self._heat_target + near:
+            gap = room - self._heat_target
+            return (
+                f"Idle, {gap:+.1f}°F from heat start",
+                "mdi:thermometer-chevron-down",
+            )
+        if room >= self._cool_target - near:
+            gap = room - self._cool_target
+            return (
+                f"Idle, {gap:+.1f}°F from cool start",
+                "mdi:thermometer-chevron-up",
+            )
+
+        # Comfortably mid-band. Surface adaptive learning if any so the
+        # user knows the system has been tuning itself.
+        learned = max(
+            self._overshoot[HVACMode.HEAT], self._overshoot[HVACMode.COOL]
+        )
+        if learned > 0:
+            return (
+                f"Idle (learned +{learned:.1f}° overshoot)",
+                "mdi:school",
+            )
+        return "Idle", "mdi:thermometer-check"
+
+    @property
+    def short_status(self) -> str:
+        return self._compute_short_status()[0]
+
+    @property
+    def short_status_icon(self) -> str:
+        return self._compute_short_status()[1]
+
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        status_text, status_icon = self._compute_short_status()
         return {
+            "short_status": status_text,
+            "short_status_icon": status_icon,
             "decision_reason": self._decision_reason,
             "active_mode": self._active_mode.value if self._active_mode else None,
             "room_temperature": self._last_room_temp,
@@ -586,6 +676,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     f"remain of min_cycle_time ({self._min_cycle}s)"
                 )
                 desired = self._active_mode
+                # The idle-branch early return below would otherwise leave
+                # decision_reason stale; surface the hold reason now.
+                if desired is None:
+                    self._decision_reason = transition_reason
 
         if desired != self._active_mode:
             if self._active_mode is None and desired is not None:
