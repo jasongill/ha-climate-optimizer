@@ -16,6 +16,7 @@ CONF_DEADBAND = "deadband"
 CONF_SETPOINT_OFFSET = "setpoint_offset"
 CONF_MIN_CYCLE_TIME = "min_cycle_time"
 CONF_TICK_INTERVAL = "tick_interval"
+CONF_START_MEASUREMENT_DELAY = "start_measurement_delay"
 
 # Fan tiers map "how far out of the target band are we" to a downstream
 # fan_mode name. Stored as four flat (error, mode) pairs so they can be
@@ -44,6 +45,7 @@ DEFAULT_DEADBAND = 0.5
 DEFAULT_SETPOINT_OFFSET = 4.0
 DEFAULT_MIN_CYCLE_TIME = 300  # seconds
 DEFAULT_TICK_INTERVAL = 30  # seconds
+DEFAULT_START_MEASUREMENT_DELAY = 120  # seconds
 
 DEFAULT_FAN_TIER_1_ERROR = 1.0
 DEFAULT_FAN_TIER_1_MODE = "low"

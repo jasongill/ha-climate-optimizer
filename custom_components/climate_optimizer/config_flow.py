@@ -27,6 +27,7 @@ from .const import (
     CONF_SETPOINT_OFFSET,
     CONF_SOURCE_HUMIDITY_SENSOR,
     CONF_SOURCE_TEMP_SENSOR,
+    CONF_START_MEASUREMENT_DELAY,
     CONF_TICK_INTERVAL,
     CONFIG_VERSION,
     DEFAULT_COOL_TARGET,
@@ -40,6 +41,7 @@ from .const import (
     DEFAULT_HEAT_TARGET,
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_SETPOINT_OFFSET,
+    DEFAULT_START_MEASUREMENT_DELAY,
     DEFAULT_TICK_INTERVAL,
     DOMAIN,
     FAN_TIER_KEYS,
@@ -127,6 +129,12 @@ def _control_fields(values: dict[str, Any]) -> dict[Any, Any]:
         vol.Required(
             CONF_TICK_INTERVAL,
             default=values.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL),
+        ): vol.Coerce(int),
+        vol.Required(
+            CONF_START_MEASUREMENT_DELAY,
+            default=values.get(
+                CONF_START_MEASUREMENT_DELAY, DEFAULT_START_MEASUREMENT_DELAY
+            ),
         ): vol.Coerce(int),
     }
 

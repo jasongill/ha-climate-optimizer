@@ -54,6 +54,7 @@ from .const import (
     CONF_SETPOINT_OFFSET,
     CONF_SOURCE_HUMIDITY_SENSOR,
     CONF_SOURCE_TEMP_SENSOR,
+    CONF_START_MEASUREMENT_DELAY,
     CONF_TICK_INTERVAL,
     DOMAIN,
     FAN_TIER_KEYS,
@@ -199,6 +200,15 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._offset = float(cfg[CONF_SETPOINT_OFFSET])
         self._min_cycle = int(cfg[CONF_MIN_CYCLE_TIME])
         self._tick_interval = int(cfg[CONF_TICK_INTERVAL])
+        # Skip the stop-threshold check for this many seconds after a cycle
+        # starts. The downstream unit's blower can blast hot/cold air past a
+        # nearby room sensor and spike its reading 3-5°F within the first
+        # 1-2 minutes, which would otherwise trip stop_at instantly and shut
+        # the cycle down before the room mass actually moves. Default 120s
+        # lands just past the typical sensor peak.
+        self._start_measurement_delay = int(
+            cfg.get(CONF_START_MEASUREMENT_DELAY, 120)
+        )
         self._fan_tiers = _build_fan_tiers(cfg)
 
         self._emergency_enable = bool(cfg[CONF_EMERGENCY_ENABLE])
@@ -401,6 +411,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 target = self._cool_target - self._overshoot[HVACMode.COOL]
                 bits = [f"Cooling → {target:.0f}°F"]
                 icon = "mdi:snowflake"
+            settle_remaining = self._start_settle_remaining_s()
+            if settle_remaining > 0:
+                bits.append(f"(settling sensor {settle_remaining}s)")
+                icon = "mdi:timer-sand-paused"
             extras: list[str] = []
             if self._setpoint_boost:
                 extras.append(f"+{self._setpoint_boost:.0f}° push")
@@ -648,6 +662,20 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             else:
                 stop_at = self._heat_target + overshoot
                 stopped = room_temp >= stop_at
+            # Suppress the stop check during the post-start sensor-settle
+            # window: the downstream blower can spike a nearby room sensor
+            # 3-5°F within the first minute or two of running, which would
+            # otherwise satisfy stop_at instantly and shut the cycle down
+            # before the room mass actually moves.
+            settle_remaining = self._start_settle_remaining_s()
+            if stopped and settle_remaining > 0:
+                stopped = False
+                transition_reason = (
+                    f"{desired.value.upper()}: room {room_temp:.1f}°F already "
+                    f"≥ stop {stop_at:.1f}°F but holding for "
+                    f"{settle_remaining}s of sensor-settle window "
+                    f"({self._start_measurement_delay}s)"
+                )
             if stopped:
                 overshoot_note = (
                     f" (adaptive overshoot {overshoot:.1f}°F)"
@@ -733,6 +761,18 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self.async_write_ha_state()
 
     # ------------------------------------------------------------------ adaptive overshoot
+
+    def _start_settle_remaining_s(self) -> int:
+        """Seconds left in the post-start sensor-settle window, or 0."""
+        if (
+            self._active_mode not in (HVACMode.HEAT, HVACMode.COOL)
+            or self._last_transition is None
+            or self._start_measurement_delay <= 0
+        ):
+            return 0
+        elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
+        remaining = self._start_measurement_delay - elapsed
+        return int(remaining) if remaining > 0 else 0
 
     def _record_cycle_start_and_adapt(self, mode: HVACMode) -> None:
         """Log a cycle start and nudge the per-mode overshoot."""

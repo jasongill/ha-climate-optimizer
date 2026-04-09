@@ -15,7 +15,8 @@
           "deadband": "Hysteresis / deadband (\u00b0F)",
           "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
           "min_cycle_time": "Minimum off time before restart (seconds)",
-          "tick_interval": "Control loop interval (seconds)"
+          "tick_interval": "Control loop interval (seconds)",
+          "start_measurement_delay": "Sensor settle delay after start (seconds) — ignore the stop threshold for this long after a cycle starts, so a blower-induced sensor spike doesn't shut the cycle down early"
         }
       },
       "fan_tiers": {
@@ -58,6 +59,7 @@
           "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
           "min_cycle_time": "Minimum off time before restart (seconds)",
           "tick_interval": "Control loop interval (seconds)",
+          "start_measurement_delay": "Sensor settle delay after start (seconds) — ignore the stop threshold for this long after a cycle starts, so a blower-induced sensor spike doesn't shut the cycle down early",
           "area_id": "Area (optional — assigns the device to a room)",
           "fan_tier_1_error": "Fan tier 1: max error from target band (\u00b0F)",
           "fan_tier_1_mode": "Fan tier 1: downstream fan mode",
