@@ -5,6 +5,7 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.components.climate import ATTR_FAN_MODES
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
@@ -57,7 +58,7 @@ def _fan_mode_options(
     state = hass.states.get(downstream_entity_id)
     if state is None:
         return None
-    fan_modes = state.attributes.get("fan_modes")
+    fan_modes = state.attributes.get(ATTR_FAN_MODES)
     if not fan_modes:
         return None
     options = [str(m) for m in fan_modes]
@@ -94,6 +95,47 @@ def _fan_tier_fields(
             vol.Required(mode_key, default=current.get(mode_key, mode_default))
         ] = _fan_mode_field(fan_options)
     return fields
+
+
+def _control_fields(values: dict[str, Any]) -> dict[Any, Any]:
+    """The six numeric "controls" fields shared by basics + options.
+
+    Same field set, same defaults — defined once so the basics step (new
+    install) and the options flow (later edits) stay in sync.
+    """
+    return {
+        vol.Required(
+            CONF_HEAT_TARGET,
+            default=values.get(CONF_HEAT_TARGET, DEFAULT_HEAT_TARGET),
+        ): vol.Coerce(float),
+        vol.Required(
+            CONF_COOL_TARGET,
+            default=values.get(CONF_COOL_TARGET, DEFAULT_COOL_TARGET),
+        ): vol.Coerce(float),
+        vol.Required(
+            CONF_DEADBAND,
+            default=values.get(CONF_DEADBAND, DEFAULT_DEADBAND),
+        ): vol.Coerce(float),
+        vol.Required(
+            CONF_SETPOINT_OFFSET,
+            default=values.get(CONF_SETPOINT_OFFSET, DEFAULT_SETPOINT_OFFSET),
+        ): vol.Coerce(float),
+        vol.Required(
+            CONF_MIN_CYCLE_TIME,
+            default=values.get(CONF_MIN_CYCLE_TIME, DEFAULT_MIN_CYCLE_TIME),
+        ): vol.Coerce(int),
+        vol.Required(
+            CONF_TICK_INTERVAL,
+            default=values.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL),
+        ): vol.Coerce(int),
+    }
+
+
+def _validate_targets(values: dict[str, Any]) -> str | None:
+    """Return an error key if heat/cool targets are invalid, else None."""
+    if values[CONF_HEAT_TARGET] >= values[CONF_COOL_TARGET]:
+        return "targets_invalid"
+    return None
 
 
 def _emergency_fields(
@@ -176,29 +218,7 @@ def _basics_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_AREA_ID,
                 description={"suggested_value": defaults.get(CONF_AREA_ID)},
             ): selector.AreaSelector(),
-            vol.Required(
-                CONF_HEAT_TARGET,
-                default=defaults.get(CONF_HEAT_TARGET, DEFAULT_HEAT_TARGET),
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_COOL_TARGET,
-                default=defaults.get(CONF_COOL_TARGET, DEFAULT_COOL_TARGET),
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_DEADBAND, default=defaults.get(CONF_DEADBAND, DEFAULT_DEADBAND)
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_SETPOINT_OFFSET,
-                default=defaults.get(CONF_SETPOINT_OFFSET, DEFAULT_SETPOINT_OFFSET),
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_MIN_CYCLE_TIME,
-                default=defaults.get(CONF_MIN_CYCLE_TIME, DEFAULT_MIN_CYCLE_TIME),
-            ): vol.Coerce(int),
-            vol.Required(
-                CONF_TICK_INTERVAL,
-                default=defaults.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL),
-            ): vol.Coerce(int),
+            **_control_fields(defaults),
         }
     )
 
@@ -224,30 +244,7 @@ def _options_schema(
                 CONF_AREA_ID,
                 description={"suggested_value": current.get(CONF_AREA_ID)},
             ): selector.AreaSelector(),
-            vol.Required(
-                CONF_HEAT_TARGET,
-                default=current.get(CONF_HEAT_TARGET, DEFAULT_HEAT_TARGET),
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_COOL_TARGET,
-                default=current.get(CONF_COOL_TARGET, DEFAULT_COOL_TARGET),
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_DEADBAND,
-                default=current.get(CONF_DEADBAND, DEFAULT_DEADBAND),
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_SETPOINT_OFFSET,
-                default=current.get(CONF_SETPOINT_OFFSET, DEFAULT_SETPOINT_OFFSET),
-            ): vol.Coerce(float),
-            vol.Required(
-                CONF_MIN_CYCLE_TIME,
-                default=current.get(CONF_MIN_CYCLE_TIME, DEFAULT_MIN_CYCLE_TIME),
-            ): vol.Coerce(int),
-            vol.Required(
-                CONF_TICK_INTERVAL,
-                default=current.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL),
-            ): vol.Coerce(int),
+            **_control_fields(current),
             **_fan_tier_fields(current, fan_options),
             **_emergency_fields(current, fan_options),
         }
@@ -274,8 +271,9 @@ class ClimateOptimizerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            if user_input[CONF_HEAT_TARGET] >= user_input[CONF_COOL_TARGET]:
-                errors["base"] = "targets_invalid"
+            target_error = _validate_targets(user_input)
+            if target_error:
+                errors["base"] = target_error
             else:
                 unique = (
                     f"{user_input[CONF_DOWNSTREAM_CLIMATE]}::"
@@ -327,8 +325,9 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
         current = {**self.config_entry.data, **self.config_entry.options}
 
         if user_input is not None:
-            if user_input[CONF_HEAT_TARGET] >= user_input[CONF_COOL_TARGET]:
-                errors["base"] = "targets_invalid"
+            target_error = _validate_targets(user_input)
+            if target_error:
+                errors["base"] = target_error
             else:
                 return self.async_create_entry(title="", data=user_input)
 

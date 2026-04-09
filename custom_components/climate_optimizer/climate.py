@@ -60,6 +60,59 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Adaptive overshoot tuning. When the gap between successive starts of the
+# same mode is shorter than ADAPTIVE_TARGET_PERIOD_S, the mode is short-
+# cycling and we extend its stop threshold by ADAPTIVE_BUMP °F (so heat runs
+# a bit past heat_target, cool runs a bit past cool_target). When a cycle
+# gap is comfortably long (> 2× target), we decay back toward 0. Capped so
+# we never overshoot more than ADAPTIVE_MAX °F.
+#
+# BUMP is 0.5 to match the typical 0.5°F room-sensor resolution — anything
+# smaller would let the internal threshold drift between sensor ticks
+# without changing observable stop behavior. DECAY is asymmetrically
+# smaller so learning persists across the night and only fades when
+# conditions clearly improve.
+ADAPTIVE_TARGET_PERIOD_S = 30 * 60
+ADAPTIVE_BUMP = 0.5
+ADAPTIVE_DECAY = 0.25
+ADAPTIVE_MAX = 2.0
+ADAPTIVE_HISTORY = 4
+
+# Fan boost tuning. Within an active cycle we sample progress every
+# FAN_PROGRESS_INTERVAL_S; if the room temperature has improved by less
+# than FAN_PROGRESS_MIN_DELTA °F over that interval (or has gotten worse),
+# we bump the fan tier up by one slot. The boost resets at the start of
+# every new cycle since the room dynamics may have changed.
+FAN_PROGRESS_INTERVAL_S = 5 * 60
+FAN_PROGRESS_MIN_DELTA = 0.5
+FAN_BOOST_MAX = 4
+
+# Setpoint boost: when stalled, push the downstream setpoint further past
+# our own target before falling back to the noisy fan boost. Inverters
+# scale compressor speed with the perceived setpoint delta, so an extra
+# °F or two of push directly increases BTU/min at no comfort cost.
+SETPOINT_BOOST_STEP = 1.0
+SETPOINT_BOOST_MAX = 4.0
+
+# Downstream temperature bias: the minisplit's own sensor often reads
+# warmer in heat / colder in cool than the actual room (high mounting,
+# self-heating, lag). We smooth the delta with an EMA and add it to the
+# pushed setpoint so the unit's *perceived* gap matches our intent.
+# Compensation only applies in the direction that makes the unit work
+# harder — never softer — and is capped to avoid runaway pushes.
+BIAS_EMA_ALPHA = 0.2
+BIAS_MAX_COMPENSATION = 5.0
+
+# Aux/Midea minisplits often only refresh their reported current_temperature
+# on a write (mode change, setpoint change), so the value can be hours
+# stale. We declare the downstream sensor STALE — and stop feeding it into
+# the bias EMA — when it has been unchanged for BIAS_STALE_AFTER_S while
+# the room sensor has moved by more than BIAS_STALE_ROOM_DELTA °F. The
+# previously-learned EMA still drives compensation while stale; we just
+# don't poison it with frozen data.
+BIAS_STALE_AFTER_S = 10 * 60
+BIAS_STALE_ROOM_DELTA = 1.0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -71,13 +124,19 @@ async def async_setup_entry(
     async_add_entities([VirtualClimateDevice(entry, merged)])
 
 
-def _as_float(state: State | None) -> float | None:
-    if state is None or state.state in (None, "", STATE_UNAVAILABLE, STATE_UNKNOWN):
+def _as_float_attr(value: Any) -> float | None:
+    """Coerce a HA state value or attribute to float, tolerating sentinels."""
+    if value is None or value in ("", STATE_UNAVAILABLE, STATE_UNKNOWN):
         return None
     try:
-        return float(state.state)
+        return float(value)
     except (ValueError, TypeError):
         return None
+
+
+def _as_float(state: State | None) -> float | None:
+    """Coerce the .state of a HA State object to float."""
+    return _as_float_attr(state.state if state is not None else None)
 
 
 def _build_fan_tiers(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -157,6 +216,36 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._last_transition: datetime | None = None
         self._last_sent: dict[str, Any] = {}
 
+        # Adaptive overshoot — recent start timestamps per mode and the
+        # current per-mode overshoot in °F applied to the stop threshold.
+        self._cycle_starts: dict[HVACMode, list[datetime]] = {
+            HVACMode.HEAT: [],
+            HVACMode.COOL: [],
+        }
+        self._overshoot: dict[HVACMode, float] = {
+            HVACMode.HEAT: 0.0,
+            HVACMode.COOL: 0.0,
+        }
+
+        # Fan boost — within-cycle escalation when progress is stalled.
+        self._fan_boost: int = 0
+        self._setpoint_boost: float = 0.0
+        self._progress_last_check: datetime | None = None
+        self._progress_last_error: float | None = None
+
+        # Smoothed delta between the downstream unit's sensor and the
+        # room sensor. Persists across cycles since it's a property of
+        # the install, not the room dynamics.
+        self._ds_bias_ema: float | None = None
+
+        # Staleness tracking for the downstream sensor — many minisplit
+        # platforms only refresh on write events, so we have to detect
+        # frozen values explicitly.
+        self._ds_last_value: float | None = None
+        self._ds_last_change_at: datetime | None = None
+        self._ds_last_change_room_temp: float | None = None
+        self._ds_stale: bool = False
+
         self._decision_reason = "Starting up"
         self._last_room_temp: float | None = None
         self._last_error: float | None = None
@@ -196,6 +285,22 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 parsed = dt_util.parse_datetime(last_transition_str)
                 if parsed is not None:
                     self._last_transition = parsed
+
+            # Restore learned adaptive state. We persist only the values
+            # that represent slow-changing physical realities — overshoot
+            # (room thermal behavior) and bias EMA (install geometry).
+            # Within-cycle boost state and staleness tracking re-bootstrap
+            # naturally within a few ticks, so they're not restored.
+            for mode, key in (
+                (HVACMode.HEAT, "adaptive_heat_overshoot"),
+                (HVACMode.COOL, "adaptive_cool_overshoot"),
+            ):
+                restored = _as_float_attr(attrs.get(key))
+                if restored is not None:
+                    self._overshoot[mode] = max(0.0, min(ADAPTIVE_MAX, restored))
+            restored_bias = _as_float_attr(attrs.get("downstream_sensor_bias"))
+            if restored_bias is not None:
+                self._ds_bias_ema = restored_bias
 
         tracked = [self._source_temp, self._downstream]
         if self._source_humidity:
@@ -257,9 +362,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
     @property
     def fan_modes(self) -> list[str] | None:
         ds = self.hass.states.get(self._downstream)
-        if ds is None:
-            return None
-        return ds.attributes.get(ATTR_FAN_MODES)
+        return ds.attributes.get(ATTR_FAN_MODES) if ds is not None else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -285,6 +388,27 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             if self._last_transition
             else None,
             "last_sent": self._last_sent,
+            "adaptive_heat_overshoot": round(self._overshoot[HVACMode.HEAT], 2),
+            "adaptive_cool_overshoot": round(self._overshoot[HVACMode.COOL], 2),
+            "fan_boost": self._fan_boost,
+            "setpoint_boost": self._setpoint_boost,
+            "downstream_sensor_bias": (
+                round(self._ds_bias_ema, 2)
+                if self._ds_bias_ema is not None
+                else None
+            ),
+            "downstream_sensor_stale": self._ds_stale,
+            "downstream_sensor_age_s": (
+                int((dt_util.utcnow() - self._ds_last_change_at).total_seconds())
+                if self._ds_last_change_at
+                else None
+            ),
+            "recent_heat_starts": [
+                t.isoformat() for t in self._cycle_starts[HVACMode.HEAT]
+            ],
+            "recent_cool_starts": [
+                t.isoformat() for t in self._cycle_starts[HVACMode.COOL]
+            ],
         }
 
     # ------------------------------------------------------------------ user commands
@@ -295,25 +419,32 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         single = kwargs.get(ATTR_TEMPERATURE)
         hvac_mode = kwargs.get(ATTR_HVAC_MODE)
 
-        if hvac_mode is not None:
-            self._attr_hvac_mode = hvac_mode
+        # Compute proposed targets without mutating self yet — that way an
+        # invalid range leaves the entity in its previous good state.
+        new_heat = self._heat_target
+        new_cool = self._cool_target
         if low is not None:
-            self._heat_target = float(low)
+            new_heat = float(low)
         if high is not None:
-            self._cool_target = float(high)
+            new_cool = float(high)
         if single is not None and low is None and high is None:
             mid = float(single)
-            half = (self._cool_target - self._heat_target) / 2 or 2.5
-            self._heat_target = mid - half
-            self._cool_target = mid + half
+            half = (new_cool - new_heat) / 2 or 2.5
+            new_heat = mid - half
+            new_cool = mid + half
 
-        if self._heat_target >= self._cool_target:
+        if new_heat >= new_cool:
             _LOGGER.warning(
                 "Invalid target range (heat %.1f >= cool %.1f), ignoring",
-                self._heat_target,
-                self._cool_target,
+                new_heat,
+                new_cool,
             )
             return
+
+        if hvac_mode is not None:
+            self._attr_hvac_mode = hvac_mode
+        self._heat_target = new_heat
+        self._cool_target = new_cool
 
         self.async_write_ha_state()
         await self._async_control()
@@ -414,22 +545,30 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     f"(start thresholds <{self._heat_target - self._deadband:.1f} "
                     f"or >{self._cool_target + self._deadband:.1f})"
                 )
-        else:
-            # Running: stop when we reach the target edge. No deadband on the
-            # stop side — we stop AT the target and then min_cycle_time
-            # prevents immediate restart, which avoids short-cycling.
-            if desired == HVACMode.COOL and room_temp <= self._cool_target:
-                desired = None
-                transition_reason = (
-                    f"Ending COOL: room {room_temp:.1f}°F reached cool_target "
-                    f"{self._cool_target:.1f}°F"
+        elif desired in (HVACMode.HEAT, HVACMode.COOL):
+            # Running: stop when we reach the target edge, optionally
+            # extended by an adaptive overshoot. The overshoot grows when
+            # the same mode has been short-cycling and decays when cycles
+            # are comfortably long, so a leaky room naturally banks more
+            # thermal mass per cycle without the user changing settings.
+            overshoot = self._overshoot[desired]
+            if desired == HVACMode.COOL:
+                stop_at = self._cool_target - overshoot
+                stopped = room_temp <= stop_at
+            else:
+                stop_at = self._heat_target + overshoot
+                stopped = room_temp >= stop_at
+            if stopped:
+                overshoot_note = (
+                    f" (adaptive overshoot {overshoot:.1f}°F)"
+                    if overshoot > 0
+                    else ""
                 )
-            elif desired == HVACMode.HEAT and room_temp >= self._heat_target:
-                desired = None
                 transition_reason = (
-                    f"Ending HEAT: room {room_temp:.1f}°F reached heat_target "
-                    f"{self._heat_target:.1f}°F"
+                    f"Ending {desired.value.upper()}: room {room_temp:.1f}°F "
+                    f"reached stop {stop_at:.1f}°F{overshoot_note}"
                 )
+                desired = None
 
         # Minimum cycle time gate — only blocks turning ON (idle → active or
         # switching between active modes). Turning OFF is always allowed.
@@ -449,6 +588,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 desired = self._active_mode
 
         if desired != self._active_mode:
+            if self._active_mode is None and desired is not None:
+                # idle → active: this is a "start" event for adaptation
+                self._record_cycle_start_and_adapt(desired)
             self._active_mode = desired
             self._last_transition = dt_util.utcnow()
             if desired is None:
@@ -495,6 +637,38 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             else HVACAction.HEATING
         )
         self.async_write_ha_state()
+
+    # ------------------------------------------------------------------ adaptive overshoot
+
+    def _record_cycle_start_and_adapt(self, mode: HVACMode) -> None:
+        """Log a cycle start and nudge the per-mode overshoot."""
+        if mode not in self._overshoot:
+            return
+        now = dt_util.utcnow()
+        history = self._cycle_starts[mode]
+        if history:
+            gap = (now - history[-1]).total_seconds()
+            if gap < ADAPTIVE_TARGET_PERIOD_S:
+                # Short-cycling: extend stop threshold to bank more thermal
+                # mass and stretch the next off-period.
+                self._overshoot[mode] = min(
+                    ADAPTIVE_MAX, self._overshoot[mode] + ADAPTIVE_BUMP
+                )
+            elif gap > 2 * ADAPTIVE_TARGET_PERIOD_S:
+                # Comfortably long gap — relax overshoot back toward zero.
+                self._overshoot[mode] = max(
+                    0.0, self._overshoot[mode] - ADAPTIVE_DECAY
+                )
+        history.append(now)
+        if len(history) > ADAPTIVE_HISTORY:
+            del history[:-ADAPTIVE_HISTORY]
+
+        # Fresh cycle — reset within-cycle boost state. Bias EMA is
+        # NOT reset; it's a property of the install, not the cycle.
+        self._fan_boost = 0
+        self._setpoint_boost = 0.0
+        self._progress_last_check = None
+        self._progress_last_error = None
 
     # ------------------------------------------------------------------ room sensor lost
 
@@ -612,16 +786,103 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         """Compute and send a normal (sensor-driven) downstream command."""
         ds_min, ds_max, ds_step = self._downstream_limits(ds_state)
 
+        # ---- Bias EMA: track how much the unit's own sensor disagrees
+        # with the room sensor, and apply it to the setpoint so the
+        # unit's *perceived* gap matches what we actually want.
+        # Skip the EMA update when the downstream sensor is stale
+        # (frozen value while the room has clearly moved).
+        now = dt_util.utcnow()
+        ds_current = _as_float_attr(ds_state.attributes.get("current_temperature"))
+        ds_stale = False
+        if ds_current is not None:
+            if (
+                self._ds_last_value is None
+                or ds_current != self._ds_last_value
+            ):
+                # Fresh value — record and clear staleness.
+                self._ds_last_value = ds_current
+                self._ds_last_change_at = now
+                self._ds_last_change_room_temp = room_temp
+            else:
+                # Same value as last time — check if it's been stuck
+                # while the room moved meaningfully.
+                age = (
+                    (now - self._ds_last_change_at).total_seconds()
+                    if self._ds_last_change_at
+                    else 0.0
+                )
+                room_delta = abs(
+                    room_temp - (self._ds_last_change_room_temp or room_temp)
+                )
+                if age > BIAS_STALE_AFTER_S and room_delta > BIAS_STALE_ROOM_DELTA:
+                    ds_stale = True
+
+            if not ds_stale:
+                raw_bias = ds_current - room_temp
+                if self._ds_bias_ema is None:
+                    self._ds_bias_ema = raw_bias
+                else:
+                    self._ds_bias_ema = (
+                        BIAS_EMA_ALPHA * raw_bias
+                        + (1 - BIAS_EMA_ALPHA) * self._ds_bias_ema
+                    )
+        self._ds_stale = ds_stale
+
+        # Compensation only in the "make it work harder" direction.
+        # For heat, a positive bias (unit reads warmer than reality) hurts;
+        # for cool, a negative bias (unit reads colder) hurts. Either way
+        # we add the absolute hurt to the setpoint push, capped.
+        bias_compensation = 0.0
+        if self._ds_bias_ema is not None:
+            signed = (
+                self._ds_bias_ema if mode == HVACMode.HEAT else -self._ds_bias_ema
+            )
+            bias_compensation = max(0.0, min(BIAS_MAX_COMPENSATION, signed))
+
         if mode == HVACMode.COOL:
-            raw_setpoint = self._cool_target - self._offset
+            raw_setpoint = (
+                self._cool_target - self._offset
+                - bias_compensation - self._setpoint_boost
+            )
             error = max(0.0, room_temp - self._cool_target)
         else:
-            raw_setpoint = self._heat_target + self._offset
+            raw_setpoint = (
+                self._heat_target + self._offset
+                + bias_compensation + self._setpoint_boost
+            )
             error = max(0.0, self._heat_target - room_temp)
 
         setpoint = self._clamp(raw_setpoint, ds_min, ds_max, ds_step)
         available_fan = ds_state.attributes.get(ATTR_FAN_MODES) or []
-        fan_mode = self._pick_fan_mode(error, available_fan)
+
+        # ---- Stalled-progress detection. On each stall window we escalate
+        # ONE lever, preferring the cheapest first: setpoint boost (free,
+        # makes the inverter modulate harder) before fan boost (noisy).
+        if self._progress_last_check is None:
+            self._progress_last_check = now
+            self._progress_last_error = error
+        else:
+            elapsed = (now - self._progress_last_check).total_seconds()
+            if elapsed >= FAN_PROGRESS_INTERVAL_S:
+                prior_error = (
+                    self._progress_last_error
+                    if self._progress_last_error is not None
+                    else error
+                )
+                improvement = prior_error - error
+                stalled = error > 0.0 and improvement < FAN_PROGRESS_MIN_DELTA
+                if stalled:
+                    if self._setpoint_boost < SETPOINT_BOOST_MAX:
+                        self._setpoint_boost = min(
+                            SETPOINT_BOOST_MAX,
+                            self._setpoint_boost + SETPOINT_BOOST_STEP,
+                        )
+                    elif self._fan_boost < FAN_BOOST_MAX:
+                        self._fan_boost += 1
+                self._progress_last_check = now
+                self._progress_last_error = error
+
+        fan_mode = self._pick_fan_mode(error, available_fan, self._fan_boost)
 
         self._last_error = error
         self._last_pushed_setpoint = setpoint
@@ -638,12 +899,30 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             stop_label = f"will stop at {self._heat_target:.1f}°F"
             offset_sign = "+"
 
+        bias_note = ""
+        if self._ds_bias_ema is not None:
+            stale_marker = " STALE" if self._ds_stale else ""
+            bias_note = (
+                f" Unit sensor bias {self._ds_bias_ema:+.1f}°F{stale_marker}"
+                f"{f' (compensated +{bias_compensation:.1f})' if bias_compensation else ''}."
+            )
+        elif ds_current is None:
+            bias_note = " Unit sensor not reported."
+        boost_note = ""
+        if self._setpoint_boost or self._fan_boost:
+            parts = []
+            if self._setpoint_boost:
+                parts.append(f"setpoint +{self._setpoint_boost:.0f}°F")
+            if self._fan_boost:
+                parts.append(f"fan +{self._fan_boost}")
+            boost_note = f" Stall boosts: {', '.join(parts)}."
+
         return (
             f"{mode.value.upper()}ING: room {room_temp:.1f}°F, {target_label}, "
             f"error {error:.1f}°F. Pushing downstream setpoint to "
             f"{setpoint:.0f}°F (target {offset_sign} {self._offset:.0f}°F offset, "
             f"clamped to {ds_min:.0f}–{ds_max:.0f}). "
-            f"Fan tier: {fan_mode or 'n/a'}. {stop_label}."
+            f"Fan tier: {fan_mode or 'n/a'}.{bias_note}{boost_note} {stop_label}."
         )
 
     async def _async_send(
@@ -715,16 +994,28 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     # ------------------------------------------------------------------ helpers
 
-    def _pick_fan_mode(self, error: float, available: list[str]) -> str | None:
+    def _pick_fan_mode(
+        self, error: float, available: list[str], boost: int = 0
+    ) -> str | None:
         if not available:
             return None
-        for tier in self._fan_tiers:
-            if error <= tier["max_error"] and tier["fan_mode"] in available:
-                return tier["fan_mode"]
-        for tier in reversed(self._fan_tiers):
-            if tier["fan_mode"] in available:
-                return tier["fan_mode"]
-        return available[0]
+        # Build the list of tiers whose fan mode is actually offered by
+        # the downstream device (in error-ascending order).
+        usable = [t for t in self._fan_tiers if t["fan_mode"] in available]
+        if not usable:
+            for tier in reversed(self._fan_tiers):
+                if tier["fan_mode"] in available:
+                    return tier["fan_mode"]
+            return available[0]
+        # Find the natural index for the current error.
+        natural_idx = len(usable) - 1
+        for idx, tier in enumerate(usable):
+            if error <= tier["max_error"]:
+                natural_idx = idx
+                break
+        # Apply boost: shift toward the louder end of the list.
+        boosted_idx = min(natural_idx + max(0, boost), len(usable) - 1)
+        return usable[boosted_idx]["fan_mode"]
 
     def _downstream_limits(
         self, ds_state: State | None = None
