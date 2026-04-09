@@ -6,7 +6,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_NAME
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 
 from .const import (
@@ -45,7 +45,46 @@ from .const import (
 )
 
 
-def _fan_tier_fields(current: dict[str, Any]) -> dict[Any, Any]:
+def _fan_mode_options(
+    hass: HomeAssistant,
+    downstream_entity_id: str | None,
+    saved_values: list[str],
+) -> list[str] | None:
+    """Return the union of the downstream climate's fan_modes and any saved
+    values, or None if the climate has no usable fan_modes attribute."""
+    if not downstream_entity_id:
+        return None
+    state = hass.states.get(downstream_entity_id)
+    if state is None:
+        return None
+    fan_modes = state.attributes.get("fan_modes")
+    if not fan_modes:
+        return None
+    options = [str(m) for m in fan_modes]
+    for value in saved_values:
+        if value and value not in options:
+            options.append(value)
+    return options
+
+
+def _fan_mode_field(
+    fan_options: list[str] | None,
+) -> Any:
+    """Validator/selector for a single fan-mode field."""
+    if fan_options is None:
+        return str
+    return selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=fan_options,
+            mode=selector.SelectSelectorMode.DROPDOWN,
+            custom_value=True,
+        )
+    )
+
+
+def _fan_tier_fields(
+    current: dict[str, Any], fan_options: list[str] | None
+) -> dict[Any, Any]:
     fields: dict[Any, Any] = {}
     for err_key, err_default, mode_key, mode_default in FAN_TIER_KEYS:
         fields[
@@ -53,11 +92,13 @@ def _fan_tier_fields(current: dict[str, Any]) -> dict[Any, Any]:
         ] = vol.Coerce(float)
         fields[
             vol.Required(mode_key, default=current.get(mode_key, mode_default))
-        ] = str
+        ] = _fan_mode_field(fan_options)
     return fields
 
 
-def _emergency_fields(current: dict[str, Any]) -> dict[Any, Any]:
+def _emergency_fields(
+    current: dict[str, Any], fan_options: list[str] | None
+) -> dict[Any, Any]:
     return {
         vol.Required(
             CONF_EMERGENCY_ENABLE,
@@ -98,11 +139,12 @@ def _emergency_fields(current: dict[str, Any]) -> dict[Any, Any]:
         vol.Required(
             CONF_EMERGENCY_FAN_MODE,
             default=current.get(CONF_EMERGENCY_FAN_MODE, DEFAULT_EMERGENCY_FAN_MODE),
-        ): str,
+        ): _fan_mode_field(fan_options),
     }
 
 
-def _user_schema(defaults: dict[str, Any]) -> vol.Schema:
+def _basics_schema(defaults: dict[str, Any]) -> vol.Schema:
+    """First config step: entities, area, targets, timing."""
     return vol.Schema(
         {
             vol.Required(CONF_NAME, default=defaults.get(CONF_NAME, "")): str,
@@ -157,13 +199,25 @@ def _user_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_TICK_INTERVAL,
                 default=defaults.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL),
             ): vol.Coerce(int),
-            **_fan_tier_fields(defaults),
-            **_emergency_fields(defaults),
         }
     )
 
 
-def _options_schema(current: dict[str, Any]) -> vol.Schema:
+def _fan_tiers_schema(
+    defaults: dict[str, Any], fan_options: list[str] | None
+) -> vol.Schema:
+    """Second config step: fan tiers + emergency."""
+    return vol.Schema(
+        {
+            **_fan_tier_fields(defaults, fan_options),
+            **_emergency_fields(defaults, fan_options),
+        }
+    )
+
+
+def _options_schema(
+    current: dict[str, Any], fan_options: list[str] | None
+) -> vol.Schema:
     return vol.Schema(
         {
             vol.Optional(
@@ -194,16 +248,26 @@ def _options_schema(current: dict[str, Any]) -> vol.Schema:
                 CONF_TICK_INTERVAL,
                 default=current.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL),
             ): vol.Coerce(int),
-            **_fan_tier_fields(current),
-            **_emergency_fields(current),
+            **_fan_tier_fields(current, fan_options),
+            **_emergency_fields(current, fan_options),
         }
     )
+
+
+def _saved_fan_mode_values(data: dict[str, Any]) -> list[str]:
+    """All fan-mode strings already stored in a config entry / form draft."""
+    values = [data.get(mode_key) for _, _, mode_key, _ in FAN_TIER_KEYS]
+    values.append(data.get(CONF_EMERGENCY_FAN_MODE))
+    return [v for v in values if isinstance(v, str)]
 
 
 class ClimateOptimizerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Climate Optimizer."""
 
     VERSION = CONFIG_VERSION
+
+    def __init__(self) -> None:
+        self._basics: dict[str, Any] = {}
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -219,14 +283,30 @@ class ClimateOptimizerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
                 await self.async_set_unique_id(unique)
                 self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=user_input[CONF_NAME], data=user_input
-                )
+                self._basics = user_input
+                return await self.async_step_fan_tiers()
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_user_schema(user_input or {}),
+            data_schema=_basics_schema(user_input or {}),
             errors=errors,
+        )
+
+    async def async_step_fan_tiers(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        if user_input is not None:
+            data = {**self._basics, **user_input}
+            return self.async_create_entry(title=data[CONF_NAME], data=data)
+
+        fan_options = _fan_mode_options(
+            self.hass,
+            self._basics.get(CONF_DOWNSTREAM_CLIMATE),
+            _saved_fan_mode_values(self._basics),
+        )
+        return self.async_show_form(
+            step_id="fan_tiers",
+            data_schema=_fan_tiers_schema(self._basics, fan_options),
         )
 
     @staticmethod
@@ -244,13 +324,21 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
+        current = {**self.config_entry.data, **self.config_entry.options}
+
         if user_input is not None:
             if user_input[CONF_HEAT_TARGET] >= user_input[CONF_COOL_TARGET]:
                 errors["base"] = "targets_invalid"
             else:
                 return self.async_create_entry(title="", data=user_input)
 
-        current = {**self.config_entry.data, **self.config_entry.options}
+        fan_options = _fan_mode_options(
+            self.hass,
+            current.get(CONF_DOWNSTREAM_CLIMATE),
+            _saved_fan_mode_values(current),
+        )
         return self.async_show_form(
-            step_id="init", data_schema=_options_schema(current), errors=errors
+            step_id="init",
+            data_schema=_options_schema(current, fan_options),
+            errors=errors,
         )
