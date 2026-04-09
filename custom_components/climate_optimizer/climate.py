@@ -33,6 +33,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -96,7 +97,7 @@ def _build_fan_tiers(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return tiers
 
 
-class VirtualClimateDevice(ClimateEntity):
+class VirtualClimateDevice(ClimateEntity, RestoreEntity):
     """Virtual climate entity that drives a downstream unit from a room sensor."""
 
     _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
@@ -166,6 +167,30 @@ class VirtualClimateDevice(ClimateEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+
+        last_state = await self.async_get_last_state()
+        if last_state is not None:
+            attrs = last_state.attributes
+            low = attrs.get("target_temp_low")
+            high = attrs.get("target_temp_high")
+            try:
+                if low is not None and high is not None:
+                    low_f = float(low)
+                    high_f = float(high)
+                    if low_f < high_f:
+                        self._heat_target = low_f
+                        self._cool_target = high_f
+            except (ValueError, TypeError):
+                _LOGGER.debug(
+                    "Could not restore target temps from %s/%s", low, high
+                )
+            if last_state.state in (
+                HVACMode.OFF,
+                HVACMode.HEAT_COOL,
+                HVACMode.HEAT,
+                HVACMode.COOL,
+            ):
+                self._attr_hvac_mode = HVACMode(last_state.state)
 
         tracked = [self._source_temp, self._downstream]
         if self._source_humidity:

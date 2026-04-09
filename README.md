@@ -40,8 +40,8 @@ All fields are set in the UI when you add the integration, and every numeric fie
 | Room humidity sensor | Optional, used for display | — |
 | Downstream climate entity | The real mini split to command | — |
 | Area | Optional area assignment for the device | — |
-| Heat target | Below this, start heating (°F) | 65 |
-| Cool target | Above this, start cooling (°F) | 70 |
+| Initial heat target | Below this, start heating (°F). Adjustable later from the thermostat card; persists across restarts. | 65 |
+| Initial cool target | Above this, start cooling (°F). Adjustable later from the thermostat card; persists across restarts. | 70 |
 | Deadband | Hysteresis before starting a cycle (°F) | 0.5 |
 | Setpoint offset | Degrees past the target to push the downstream setpoint | 4 |
 | Minimum cycle time | Seconds to wait between transitions | 300 |
