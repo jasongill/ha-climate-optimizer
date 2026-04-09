@@ -434,6 +434,19 @@ class VirtualClimateDevice(ClimateEntity):
             self._last_error = 0.0
             self._last_pushed_setpoint = None
             self._last_fan_tier = None
+            if ds_state.state != "off":
+                _LOGGER.warning(
+                    "Downstream %s is %s while virtual device is idle; "
+                    "re-asserting off",
+                    self._downstream,
+                    ds_state.state,
+                )
+                self._last_sent = {}
+                await self._async_stop_downstream()
+                self._decision_reason = (
+                    f"IDLE: downstream was {ds_state.state}, re-asserted off. "
+                    f"{self._decision_reason}"
+                )
             self.async_write_ha_state()
             return
 
