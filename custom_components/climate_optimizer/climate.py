@@ -191,6 +191,11 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 HVACMode.COOL,
             ):
                 self._attr_hvac_mode = HVACMode(last_state.state)
+            last_transition_str = attrs.get("last_transition")
+            if last_transition_str:
+                parsed = dt_util.parse_datetime(last_transition_str)
+                if parsed is not None:
+                    self._last_transition = parsed
 
         tracked = [self._source_temp, self._downstream]
         if self._source_humidity:
@@ -426,14 +431,19 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     f"{self._heat_target:.1f}°F"
                 )
 
-        # Minimum cycle time gate on transitions.
-        if desired != self._active_mode and self._last_transition is not None:
+        # Minimum cycle time gate — only blocks turning ON (idle → active or
+        # switching between active modes). Turning OFF is always allowed.
+        if (
+            desired is not None
+            and desired != self._active_mode
+            and self._last_transition is not None
+        ):
             elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
             if elapsed < self._min_cycle:
                 remaining = int(self._min_cycle - elapsed)
                 transition_reason = (
-                    f"Min cycle hold: wanted to change to "
-                    f"{desired.value if desired else 'idle'} but {remaining}s "
+                    f"Min cycle hold: wanted to start "
+                    f"{desired.value} but {remaining}s "
                     f"remain of min_cycle_time ({self._min_cycle}s)"
                 )
                 desired = self._active_mode
@@ -541,8 +551,12 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             self.async_write_ha_state()
             return
 
-        # Apply min-cycle gate to emergency transitions too.
-        if desired != self._active_mode and self._last_transition is not None:
+        # Apply min-cycle gate to emergency transitions too — only on turn-on.
+        if (
+            desired is not None
+            and desired != self._active_mode
+            and self._last_transition is not None
+        ):
             elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
             if elapsed < self._min_cycle:
                 desired = self._active_mode or desired

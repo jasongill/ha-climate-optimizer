@@ -14,7 +14,7 @@
           "cool_target": "Initial cool target (\u00b0F) — adjustable later from the thermostat card",
           "deadband": "Hysteresis / deadband (\u00b0F)",
           "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
-          "min_cycle_time": "Minimum cycle time (seconds)",
+          "min_cycle_time": "Minimum off time before restart (seconds)",
           "tick_interval": "Control loop interval (seconds)"
         }
       },
@@ -56,7 +56,7 @@
           "cool_target": "Cool target (\u00b0F)",
           "deadband": "Hysteresis / deadband (\u00b0F)",
           "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
-          "min_cycle_time": "Minimum cycle time (seconds)",
+          "min_cycle_time": "Minimum off time before restart (seconds)",
           "tick_interval": "Control loop interval (seconds)",
           "area_id": "Area (optional — assigns the device to a room)",
           "fan_tier_1_error": "Fan tier 1: max error from target band (\u00b0F)",
