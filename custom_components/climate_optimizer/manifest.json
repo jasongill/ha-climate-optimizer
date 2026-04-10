@@ -1,7 +1,7 @@
 {
   "domain": "climate_optimizer",
   "name": "Climate Optimizer",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "config_flow": true,
   "documentation": "https://github.com/jasongill/ha-climate-optimizer",
   "issue_tracker": "https://github.com/jasongill/ha-climate-optimizer/issues",
