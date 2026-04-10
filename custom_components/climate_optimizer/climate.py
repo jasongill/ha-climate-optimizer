@@ -161,6 +161,13 @@ SUSTAIN_CONFIDENCE_GOOD_DECAY = 0.25  # decay when a cycle has slow decay (room 
 SUSTAIN_CONFIDENCE_PREEMPT = 0.5  # threshold to skip detection and enter immediately
 SUSTAIN_CONFIDENCE_MAX = 1.0
 
+# Sustain safety cap: if the room sensor overshoots the target by more than
+# this many °F while sustain is holding, force-exit sustain. This catches
+# vent-adjacent sensors that read supply air instead of room air — the
+# temperature climbs far past target and never stabilises, so the normal
+# stability-based exit never fires.
+SUSTAIN_OVERSHOOT_EXIT = 5.0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -838,18 +845,41 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 # Sustain mode: instead of cycling off, keep running on
                 # low fan to maintain temperature in leaky rooms.
                 if self._sustain_active.get(desired, False):
-                    should_exit = self._check_sustain_exit(room_temp, desired)
+                    # Safety cap: if the sensor reads far past the target,
+                    # the sensor is likely reading supply air (vent-adjacent)
+                    # rather than room air. Force-exit sustain to stop
+                    # heating/cooling far beyond the desired range.
+                    if desired == HVACMode.HEAT:
+                        overshoot_past = room_temp - self._heat_target
+                    else:
+                        overshoot_past = self._cool_target - room_temp
+                    if overshoot_past > SUSTAIN_OVERSHOOT_EXIT:
+                        should_exit = True
+                        _LOGGER.warning(
+                            "Sustain safety cap for %s: sensor reads %.1f°F, "
+                            "which is %.1f°F past target (cap %.1f°F). "
+                            "Sensor may be reading supply air. Forcing exit.",
+                            desired.value,
+                            room_temp,
+                            overshoot_past,
+                            SUSTAIN_OVERSHOOT_EXIT,
+                        )
+                    else:
+                        should_exit = self._check_sustain_exit(room_temp, desired)
                     if should_exit:
                         self._sustain_active[desired] = False
                         self._sustain_decay_count[desired] = 0
                         self._reset_sustain_cycle_state()
-                        # Small confidence decay — we still mostly trust
-                        # that this room is leaky, but give it a chance
-                        # to prove otherwise.
+                        # Larger confidence decay when hitting the safety
+                        # cap — the sensor may not be suitable for sustain.
+                        if overshoot_past > SUSTAIN_OVERSHOOT_EXIT:
+                            confidence_penalty = SUSTAIN_CONFIDENCE_BUMP
+                        else:
+                            confidence_penalty = SUSTAIN_CONFIDENCE_EXIT_DECAY
                         self._sustain_confidence[desired] = max(
                             0.0,
                             self._sustain_confidence[desired]
-                            - SUSTAIN_CONFIDENCE_EXIT_DECAY,
+                            - confidence_penalty,
                         )
                         _LOGGER.info(
                             "Exiting sustain mode for %s: temp stable "
