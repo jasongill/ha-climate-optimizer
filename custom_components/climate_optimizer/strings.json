@@ -3,41 +3,15 @@
     "step": {
       "user": {
         "title": "Virtual Climate Device",
-        "description": "Create a virtual climate entity that uses a room sensor to control a downstream mini split.",
+        "description": "Create a virtual climate entity that uses a room sensor to control a downstream mini split. All other settings use smart defaults and can be tuned later via Configure.",
         "data": {
           "name": "Virtual Climate Device Name",
           "source_temp_sensor": "Room temperature sensor",
           "source_humidity_sensor": "Room humidity sensor (optional)",
           "downstream_climate": "Downstream climate entity (the mini split)",
-          "area_id": "Area (optional — assigns the device to a room)",
-          "heat_target": "Initial heat target (\u00b0F) — adjustable later from the thermostat card",
-          "cool_target": "Initial cool target (\u00b0F) — adjustable later from the thermostat card",
-          "deadband": "Hysteresis / deadband (\u00b0F)",
-          "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
-          "min_cycle_time": "Minimum off time before restart (seconds)",
-          "tick_interval": "Control loop interval (seconds)",
-          "start_measurement_delay": "Sensor settle delay after start (seconds) — ignore the stop threshold for this long after a cycle starts, so a blower-induced sensor spike doesn't shut the cycle down early"
-        }
-      },
-      "fan_tiers": {
-        "title": "Fan Tiers & Emergency Fallback",
-        "description": "Fan modes are populated from the downstream climate entity you selected. Tier 4 is the catch-all — leave its error at a large number.",
-        "data": {
-          "fan_tier_1_error": "Fan tier 1: max error from target band (\u00b0F)",
-          "fan_tier_1_mode": "Fan tier 1: downstream fan mode",
-          "fan_tier_2_error": "Fan tier 2: max error from target band (\u00b0F)",
-          "fan_tier_2_mode": "Fan tier 2: downstream fan mode",
-          "fan_tier_3_error": "Fan tier 3: max error from target band (\u00b0F)",
-          "fan_tier_3_mode": "Fan tier 3: downstream fan mode",
-          "fan_tier_4_error": "Fan tier 4: max error (use a large number for 'everything else')",
-          "fan_tier_4_mode": "Fan tier 4: downstream fan mode",
-          "emergency_enable": "Enable emergency fallback when the room sensor is unavailable",
-          "outdoor_temp_sensor": "Outdoor temperature sensor (optional, for emergency fallback)",
-          "emergency_heat_below_outdoor": "Emergency: force heat when outdoor is below (\u00b0F)",
-          "emergency_cool_above_outdoor": "Emergency: force cool when outdoor is above (\u00b0F)",
-          "emergency_heat_setpoint": "Emergency heat setpoint sent to mini split (\u00b0F)",
-          "emergency_cool_setpoint": "Emergency cool setpoint sent to mini split (\u00b0F)",
-          "emergency_fan_mode": "Emergency fan mode"
+          "area_id": "Area (optional \u2014 assigns the device to a room)",
+          "heat_target": "Heat target (\u00b0F)",
+          "cool_target": "Cool target (\u00b0F)"
         }
       }
     },
@@ -52,15 +26,29 @@
     "step": {
       "init": {
         "title": "Climate Optimizer Options",
+        "menu_options": {
+          "targets": "Targets & Area",
+          "advanced": "Advanced Settings"
+        }
+      },
+      "targets": {
+        "title": "Targets & Area",
         "data": {
           "heat_target": "Heat target (\u00b0F)",
           "cool_target": "Cool target (\u00b0F)",
+          "area_id": "Area (optional \u2014 assigns the device to a room)"
+        }
+      },
+      "advanced": {
+        "title": "Advanced Settings",
+        "description": "Timing, fan tiers, and emergency fallback. Most users won't need to change these \u2014 the adaptive control system handles tuning automatically.",
+        "data": {
           "deadband": "Hysteresis / deadband (\u00b0F)",
           "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
           "min_cycle_time": "Minimum off time before restart (seconds)",
           "tick_interval": "Control loop interval (seconds)",
-          "start_measurement_delay": "Sensor settle delay after start (seconds) — ignore the stop threshold for this long after a cycle starts, so a blower-induced sensor spike doesn't shut the cycle down early",
-          "area_id": "Area (optional — assigns the device to a room)",
+          "start_measurement_delay": "Sensor settle delay after cycle start (seconds)",
+          "room_sensor_stale_minutes": "Treat room sensor as lost if no update for this many minutes (0 to disable)",
           "fan_tier_1_error": "Fan tier 1: max error from target band (\u00b0F)",
           "fan_tier_1_mode": "Fan tier 1: downstream fan mode",
           "fan_tier_2_error": "Fan tier 2: max error from target band (\u00b0F)",

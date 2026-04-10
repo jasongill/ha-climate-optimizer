@@ -49,6 +49,20 @@ Once setpoint boost is exhausted and progress is *still* stalled, the chosen fan
 
 Both within-cycle boosts reset on every new cycle.
 
+### Sustain mode (per zone, persists across restarts)
+
+In poorly insulated rooms, the unit's discharge air can spike a nearby room sensor 5–7°F within the first two minutes of a cycle, tricking the stop threshold into firing before the room mass has actually moved. The result is a sawtooth: blast to 70°F (sensor blowby), shut off, lose heat at ~0.2°F/min back to 63°F, repeat.
+
+Sustain mode detects this pattern and switches strategy: instead of cycling off, the unit stays on with the lowest fan tier so the inverter modulates at minimum output, providing a steady trickle of heat (or cool) rather than blast-and-coast.
+
+**Detection:** After each cycle ends, the integration measures how fast the room temperature decays. If it drops more than `2°F` within `10 minutes` for two consecutive cycles of the same mode, sustain mode activates.
+
+**Behavior:** The unit keeps running on low fan with a gentle setpoint (just target + offset, no boost/bias push). If low fan can't hold the temperature — the room is still losing ground after `5 minutes` — the fan escalates one tier at a time until equilibrium is reached.
+
+**Exit:** When the room temperature stabilizes (rate of change < `0.1°F/min` for `5 minutes`), the integration tries cycling off normally. If the room decays rapidly again, sustain re-engages after two more rapid-decay cycles.
+
+**Confidence learning:** Each rapid-decay cycle builds a per-mode confidence score (0–1). When confidence reaches `0.5`, the integration skips the detection phase on future cycles and enters sustain immediately — so a consistently leaky room doesn't re-learn every time. Confidence decays slowly when conditions improve (e.g., warmer weather, better insulation).
+
 ### Visibility
 Every adaptive value is exposed as an entity attribute so you can see exactly what the system has learned and why it's doing what it's doing:
 
@@ -62,10 +76,16 @@ Every adaptive value is exposed as an entity attribute so you can see exactly wh
 | `setpoint_boost` | Current within-cycle setpoint push (resets per cycle) |
 | `fan_boost` | Current within-cycle fan-tier escalation (resets per cycle) |
 | `recent_heat_starts` / `recent_cool_starts` | Recent cycle start timestamps used by the overshoot logic |
+| `sustain_heat_active` / `sustain_cool_active` | Whether sustain mode is currently engaged per mode |
+| `sustain_heat_confidence` / `sustain_cool_confidence` | Learned confidence that this room needs sustain (0–1) |
+| `sustain_fan_boost` | Current fan escalation level within sustain mode |
+| `sustain_heat_decay_count` / `sustain_cool_decay_count` | Consecutive rapid-decay cycles counted toward sustain trigger |
 
-## Configuration options
+## Configuration
 
-All fields are set in the UI when you add the integration, and every numeric field is editable later via **Configure** on the integration entry.
+### Setup (initial)
+
+When you add the integration, you only need to provide the essentials. Everything else uses smart defaults and the adaptive control system handles tuning automatically.
 
 | Field | Meaning | Default |
 | --- | --- | --- |
@@ -74,41 +94,33 @@ All fields are set in the UI when you add the integration, and every numeric fie
 | Room humidity sensor | Optional, used for display | — |
 | Downstream climate entity | The real mini split to command | — |
 | Area | Optional area assignment for the device | — |
-| Initial heat target | Below this, start heating (°F). Adjustable later from the thermostat card; persists across restarts. | 65 |
-| Initial cool target | Above this, start cooling (°F). Adjustable later from the thermostat card; persists across restarts. | 70 |
+| Heat target | Below this, start heating (°F). Adjustable later from the thermostat card; persists across restarts. | 62 |
+| Cool target | Above this, start cooling (°F). Adjustable later from the thermostat card; persists across restarts. | 74 |
+
+### Options (Configure → Targets & Area)
+
+After setup, use **Configure** on the integration entry to adjust heat/cool targets and area assignment.
+
+### Options (Configure → Advanced Settings)
+
+For power users. Most installs won't need to touch these — the adaptive systems handle tuning.
+
+| Field | Meaning | Default |
+| --- | --- | --- |
 | Deadband | Hysteresis before starting a cycle (°F) | 0.5 |
 | Setpoint offset | Degrees past the target to push the downstream setpoint | 4 |
 | Minimum cycle time | Seconds to wait between transitions | 300 |
 | Control loop interval | Safety-net tick in addition to sensor updates (s) | 30 |
+| Start measurement delay | Seconds to ignore stop threshold after cycle start (avoids sensor blowby false stops) | 120 |
+| Room sensor stale minutes | If the room sensor hasn't updated in this many minutes, treat it as lost and trigger emergency mode (0 to disable) | 60 |
+| Fan tiers (4 tiers) | Maps error-from-target to a fan mode name. Defaults: ≤1°F → `low`, ≤3°F → `medium`, ≤5°F → `high`, everything else → `turbo`. Fan mode names are free-form strings, so any downstream unit's naming works. | See left |
+| Emergency fallback | When the room sensor goes offline or stale: optionally force heat/cool based on outdoor temp to protect the room. | Enabled |
+| Outdoor temp sensor | For emergency fallback decisions | — |
+| Emergency thresholds | Force heat below 40°F outdoor, force cool above 90°F outdoor | 40 / 90 |
+| Emergency setpoints | Conservative fixed setpoints during emergency | Heat 62°F, Cool 80°F |
+| Emergency fan mode | Fan mode during emergency | `high` |
 
-## Fan tiering
-
-The integration maps "how far out of the target band are we" to a downstream fan mode. Four tiers are configurable directly in the UI, each a `(max_error, fan_mode)` pair. Defaults:
-
-| Error from target band | Fan mode |
-| --- | --- |
-| ≤ 1°F | `low` |
-| ≤ 3°F | `medium` |
-| ≤ 5°F | `high` |
-| everything else | `turbo` |
-
-Fan mode names are free-form strings, so any downstream unit's naming works. If the exact mode name isn't supported by the downstream entity, the integration falls back to the nearest available mode.
-
-## Emergency fallback
-
-When the room sensor becomes `unknown` or `unavailable`, the integration has two possible behaviors:
-
-1. **Disabled** — the downstream unit is turned off. Safer than running blind.
-2. **Enabled (default)** — the integration consults an optional outdoor temperature sensor. If the outdoor temperature is outside a configured safe band, it forces heat or cool at a conservative fixed setpoint and fan mode until the room sensor recovers. If no outdoor sensor is configured (or it is also unavailable), the downstream unit is turned off.
-
-Defaults:
-
-- Force heat when outdoor is below **35°F**, at a setpoint of **62°F** on `low` fan
-- Force cool when outdoor is above **95°F**, at a setpoint of **80°F** on `low` fan
-
-Emergency mode still respects the virtual entity's current `hvac_mode` — if you've set it to `heat_only`, it won't emergency-cool you.
-
-An `emergency_active` attribute is exposed on the virtual entity, and a warning is logged when emergency mode engages or disengages.
+Emergency mode respects the virtual entity's current `hvac_mode` — if you've set it to `heat_only`, it won't emergency-cool you.
 
 ## Control source
 
