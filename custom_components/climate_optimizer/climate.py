@@ -118,7 +118,7 @@ SETPOINT_BOOST_MAX = 4.0
 # Compensation only applies in the direction that makes the unit work
 # harder — never softer — and is capped to avoid runaway pushes.
 BIAS_EMA_ALPHA = 0.2
-BIAS_MAX_COMPENSATION = 5.0
+BIAS_MAX_COMPENSATION = 10.0
 
 # Aux/Midea minisplits often only refresh their reported current_temperature
 # on a write (mode change, setpoint change), so the value can be hours
@@ -160,6 +160,16 @@ SUSTAIN_CONFIDENCE_EXIT_DECAY = 0.1  # small decay on sustain exit
 SUSTAIN_CONFIDENCE_GOOD_DECAY = 0.25  # decay when a cycle has slow decay (room improved)
 SUSTAIN_CONFIDENCE_PREEMPT = 0.5  # threshold to skip detection and enter immediately
 SUSTAIN_CONFIDENCE_MAX = 1.0
+
+# Cycle-duration-based sustain trigger: when the unit can barely move the room
+# temperature (e.g., unit sensor reads 10°F+ above reality so the inverter
+# barely runs), the absolute decay threshold may never be reached. Instead,
+# detect flapping by counting short cycles: if SUSTAIN_SHORT_CYCLE_COUNT
+# cycles of the same mode complete in under SUSTAIN_SHORT_CYCLE_MAX_S each,
+# within a rolling SUSTAIN_SHORT_CYCLE_WINDOW_S window, enter sustain.
+SUSTAIN_SHORT_CYCLE_MAX_S = 15 * 60    # a cycle under 15 min is "short"
+SUSTAIN_SHORT_CYCLE_COUNT = 3          # 3 short cycles in the window → sustain
+SUSTAIN_SHORT_CYCLE_WINDOW_S = 45 * 60  # 45-minute rolling window
 
 # Sustain safety cap: if the room sensor overshoots the target by more than
 # this many °F while sustain is holding, force-exit sustain. This catches
@@ -299,6 +309,12 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         # Adaptive overshoot — recent start timestamps per mode and the
         # current per-mode overshoot in °F applied to the stop threshold.
         self._cycle_starts: dict[HVACMode, list[datetime]] = {
+            HVACMode.HEAT: [],
+            HVACMode.COOL: [],
+        }
+        # Recent cycle durations (seconds) for short-cycle sustain detection.
+        # Each entry is (end_time, duration_s). Pruned to the rolling window.
+        self._cycle_durations: dict[HVACMode, list[tuple[datetime, float]]] = {
             HVACMode.HEAT: [],
             HVACMode.COOL: [],
         }
@@ -663,6 +679,14 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "sustain_cool_confidence": round(
                 self._sustain_confidence[HVACMode.COOL], 2
             ),
+            "sustain_heat_short_cycles": len([
+                d for _, d in self._cycle_durations.get(HVACMode.HEAT, [])
+                if d <= SUSTAIN_SHORT_CYCLE_MAX_S
+            ]),
+            "sustain_cool_short_cycles": len([
+                d for _, d in self._cycle_durations.get(HVACMode.COOL, [])
+                if d <= SUSTAIN_SHORT_CYCLE_MAX_S
+            ]),
         }
 
     # ------------------------------------------------------------------ user commands
@@ -943,8 +967,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             self._active_mode = desired
             self._last_transition = dt_util.utcnow()
             if desired is None:
-                # active → idle: start decay tracking for sustain detection
+                # active → idle: record cycle duration for short-cycle
+                # sustain detection, then start decay tracking.
                 if prev_mode in (HVACMode.HEAT, HVACMode.COOL):
+                    self._record_cycle_duration(prev_mode)
                     self._sustain_decay_ref_temp = room_temp
                     self._sustain_decay_ref_time = dt_util.utcnow()
                     self._sustain_decay_ref_mode = prev_mode
@@ -1044,6 +1070,30 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._progress_last_error = None
 
     # ------------------------------------------------------------------ sustain mode
+
+    def _record_cycle_duration(self, mode: HVACMode) -> None:
+        """Record a completed cycle's duration for short-cycle detection."""
+        if self._last_transition is None:
+            return
+        now = dt_util.utcnow()
+        duration = (now - self._last_transition).total_seconds()
+        history = self._cycle_durations[mode]
+        history.append((now, duration))
+        # Prune entries outside the rolling window.
+        cutoff = now - timedelta(seconds=SUSTAIN_SHORT_CYCLE_WINDOW_S)
+        self._cycle_durations[mode] = [
+            (t, d) for t, d in history if t > cutoff
+        ]
+
+    def _check_short_cycle_sustain(self, mode: HVACMode) -> bool:
+        """Return True if recent cycling pattern warrants sustain entry."""
+        now = dt_util.utcnow()
+        cutoff = now - timedelta(seconds=SUSTAIN_SHORT_CYCLE_WINDOW_S)
+        recent = [
+            (t, d) for t, d in self._cycle_durations.get(mode, [])
+            if t > cutoff and d <= SUSTAIN_SHORT_CYCLE_MAX_S
+        ]
+        return len(recent) >= SUSTAIN_SHORT_CYCLE_COUNT
 
     def _reset_sustain_cycle_state(self) -> None:
         """Reset within-sustain tracking state (on enter or exit)."""
@@ -1177,6 +1227,22 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     mode.value,
                     confidence,
                     SUSTAIN_CONFIDENCE_PREEMPT,
+                )
+            elif self._check_short_cycle_sustain(mode):
+                self._sustain_active[mode] = True
+                self._reset_sustain_cycle_state()
+                short_cycles = [
+                    d for t, d in self._cycle_durations.get(mode, [])
+                    if d <= SUSTAIN_SHORT_CYCLE_MAX_S
+                ]
+                _LOGGER.warning(
+                    "Entering SUSTAIN mode for %s: %d short cycles "
+                    "detected (under %ds each) in rolling %ds window "
+                    "(unit may not be heating/cooling effectively)",
+                    mode.value,
+                    len(short_cycles),
+                    SUSTAIN_SHORT_CYCLE_MAX_S,
+                    SUSTAIN_SHORT_CYCLE_WINDOW_S,
                 )
 
     def _check_sustain_exit(self, room_temp: float, mode: HVACMode) -> bool:
