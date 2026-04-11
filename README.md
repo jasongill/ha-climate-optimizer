@@ -49,20 +49,6 @@ Once setpoint boost is exhausted and progress is *still* stalled, the chosen fan
 
 Both within-cycle boosts reset on every new cycle.
 
-### Sustain mode (per zone, persists across restarts)
-
-In poorly insulated rooms, the unit's discharge air can spike a nearby room sensor 5–7°F within the first two minutes of a cycle, tricking the stop threshold into firing before the room mass has actually moved. The result is a sawtooth: blast to 70°F (sensor blowby), shut off, lose heat at ~0.2°F/min back to 63°F, repeat.
-
-Sustain mode detects this pattern and switches strategy: instead of cycling off, the unit stays on with the lowest fan tier so the inverter modulates at minimum output, providing a steady trickle of heat (or cool) rather than blast-and-coast.
-
-**Detection:** After each cycle ends, the integration measures how fast the room temperature decays. If it drops more than `2°F` within `10 minutes` for two consecutive cycles of the same mode, sustain mode activates.
-
-**Behavior:** The unit keeps running on low fan with a gentle setpoint (just target + offset, no boost/bias push). If low fan can't hold the temperature — the room is still losing ground after `5 minutes` — the fan escalates one tier at a time until equilibrium is reached.
-
-**Exit:** When the room temperature stabilizes (rate of change < `0.1°F/min` for `5 minutes`), the integration tries cycling off normally. If the room decays rapidly again, sustain re-engages after two more rapid-decay cycles.
-
-**Confidence learning:** Each rapid-decay cycle builds a per-mode confidence score (0–1). When confidence reaches `0.5`, the integration skips the detection phase on future cycles and enters sustain immediately — so a consistently leaky room doesn't re-learn every time. Confidence decays slowly when conditions improve (e.g., warmer weather, better insulation).
-
 ### Visibility
 Every adaptive value is exposed as an entity attribute so you can see exactly what the system has learned and why it's doing what it's doing:
 
@@ -76,10 +62,6 @@ Every adaptive value is exposed as an entity attribute so you can see exactly wh
 | `setpoint_boost` | Current within-cycle setpoint push (resets per cycle) |
 | `fan_boost` | Current within-cycle fan-tier escalation (resets per cycle) |
 | `recent_heat_starts` / `recent_cool_starts` | Recent cycle start timestamps used by the overshoot logic |
-| `sustain_heat_active` / `sustain_cool_active` | Whether sustain mode is currently engaged per mode |
-| `sustain_heat_confidence` / `sustain_cool_confidence` | Learned confidence that this room needs sustain (0–1) |
-| `sustain_fan_boost` | Current fan escalation level within sustain mode |
-| `sustain_heat_decay_count` / `sustain_cool_decay_count` | Consecutive rapid-decay cycles counted toward sustain trigger |
 
 ## Configuration
 

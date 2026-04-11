@@ -131,70 +131,6 @@ BIAS_STALE_AFTER_S = 10 * 60
 BIAS_STALE_ROOM_DELTA = 1.0
 
 
-# Sustain mode: when the room loses heat (or gains it, for cool) faster
-# than the unit can maintain via bang-bang cycling, we detect the rapid
-# post-cycle decay and switch to running the unit continuously on low fan.
-#
-# Detection: after a cycle ends, if the temp decays by more than
-# SUSTAIN_DECAY_THRESHOLD °F within SUSTAIN_DECAY_WINDOW_S, that cycle
-# is counted as a "rapid decay". After SUSTAIN_TRIGGER_CYCLES consecutive
-# rapid-decay cycles of the same mode, we enter sustain mode.
-#
-# In sustain mode the unit stays on with the lowest fan tier and a setpoint
-# just past the target (heat_target + offset, cool_target − offset). We
-# exit when the temp has been stable (rate of change < SUSTAIN_STABLE_RATE
-# °F/min) for SUSTAIN_STABLE_WINDOW_S, meaning the room has reached
-# thermal equilibrium with the low output.
-SUSTAIN_DECAY_THRESHOLD = 2.0   # °F drop within the window to count as rapid
-SUSTAIN_DECAY_WINDOW_S = 10 * 60  # 10 minutes after cycle ends
-SUSTAIN_TRIGGER_CYCLES = 2      # consecutive rapid-decay cycles to trigger
-SUSTAIN_STABLE_RATE = 0.1       # °F/min — below this we consider temp stable
-SUSTAIN_STABLE_WINDOW_S = 5 * 60  # must stay stable for 5 min to exit
-
-# Sustain confidence: a 0.0–1.0 score per mode that builds up when sustain
-# runs successfully and decays when conditions improve. When confidence is
-# high enough at cycle start, we skip detection and enter sustain immediately.
-# This lets a consistently leaky room avoid re-learning every time.
-SUSTAIN_CONFIDENCE_BUMP = 0.25  # per successful sustain cycle (held temp)
-SUSTAIN_CONFIDENCE_EXIT_DECAY = 0.1  # small decay on sustain exit
-SUSTAIN_CONFIDENCE_GOOD_DECAY = 0.25  # decay when a cycle has slow decay (room improved)
-SUSTAIN_CONFIDENCE_PREEMPT = 0.5  # threshold to skip detection and enter immediately
-SUSTAIN_CONFIDENCE_MAX = 1.0
-
-# Predictive sustain: after a single cycle completes, observe the post-cycle
-# decay for a short window. Extrapolate the decay rate to predict when the
-# room will cross the start threshold and need to restart. If the predicted
-# full cycle period (on + off) is short AND the cycle barely moved the room
-# sensor, the room is going to flap — enter sustain on the very next start.
-#
-# This catches rooms where the absolute decay never reaches
-# SUSTAIN_DECAY_THRESHOLD (e.g., the unit's internal sensor reads 10°F+
-# above reality so the inverter barely runs and each cycle gains <1.5°F).
-# Path 1 — immediate: if a short cycle barely moved the room sensor, the
-# room is just above the start threshold and will coast back down. We can
-# flag for sustain right at cycle end with zero observation delay.
-SUSTAIN_PREDICT_MIN_GAIN = 2.0          # °F — cycles gaining less are ineffective
-SUSTAIN_PREDICT_MAX_CYCLE_S = 15 * 60   # only flag short cycles (≤ 15 min)
-# Path 2 — observed: for cycles with larger sensor movement (e.g., a vent-
-# adjacent sensor that spikes from supply air), we observe 10 min of post-
-# cycle decay and extrapolate to predict when the room will restart. 10 min
-# accounts for thermal lag (the room keeps warming 2–3 min after the unit
-# stops, then begins to cool).
-SUSTAIN_PREDICT_OBSERVE_S = 10 * 60     # 10 min of decay observation
-SUSTAIN_PREDICT_MAX_PERIOD_S = 45 * 60  # predicted period under 45 min → flapping
-# When outdoor temp is available and the indoor-outdoor delta exceeds this
-# threshold, relax the gain check (the unit is fighting a large thermal
-# gradient and may need sustain even if each cycle moves the sensor >2°F).
-SUSTAIN_PREDICT_OUTDOOR_DELTA = 25.0    # °F
-
-# Sustain safety cap: if the room sensor overshoots the target by more than
-# this many °F while sustain is holding, force-exit sustain. This catches
-# vent-adjacent sensors that read supply air instead of room air — the
-# temperature climbs far past target and never stabilises, so the normal
-# stability-based exit never fires.
-SUSTAIN_OVERSHOOT_EXIT = 5.0
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -328,13 +264,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             HVACMode.HEAT: [],
             HVACMode.COOL: [],
         }
-        # Predictive sustain — single-cycle prediction state.
-        self._sustain_last_cycle_duration: float | None = None
-        self._sustain_cycle_start_temp: float | None = None
-        self._sustain_predict_flag: dict[HVACMode, bool] = {
-            HVACMode.HEAT: False,
-            HVACMode.COOL: False,
-        }
         self._overshoot: dict[HVACMode, float] = {
             HVACMode.HEAT: 0.0,
             HVACMode.COOL: 0.0,
@@ -358,39 +287,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._ds_last_change_at: datetime | None = None
         self._ds_last_change_room_temp: float | None = None
         self._ds_stale: bool = False
-
-        # Sustain mode — continuous low-fan operation for leaky rooms.
-        # _sustain_active is the per-mode flag; _sustain_decay_count tracks
-        # consecutive rapid-decay cycles; _sustain_* fields track post-cycle
-        # decay measurement and in-mode stability detection.
-        self._sustain_active: dict[HVACMode, bool] = {
-            HVACMode.HEAT: False,
-            HVACMode.COOL: False,
-        }
-        self._sustain_decay_count: dict[HVACMode, int] = {
-            HVACMode.HEAT: 0,
-            HVACMode.COOL: 0,
-        }
-        # Sustain confidence — learned memory of how often this room
-        # needs sustain for each mode. Persists across restarts.
-        self._sustain_confidence: dict[HVACMode, float] = {
-            HVACMode.HEAT: 0.0,
-            HVACMode.COOL: 0.0,
-        }
-        # Post-cycle decay tracking: temp and time when the last cycle ended.
-        self._sustain_decay_ref_temp: float | None = None
-        self._sustain_decay_ref_time: datetime | None = None
-        self._sustain_decay_ref_mode: HVACMode | None = None
-        self._sustain_decay_measured: bool = False
-        # In-sustain stability tracking for exit detection.
-        self._sustain_stable_since: datetime | None = None
-        self._sustain_last_temp: float | None = None
-        self._sustain_last_temp_time: datetime | None = None
-        # In-sustain fan escalation: if low fan can't hold the temp,
-        # we ramp up. Resets when sustain exits or a new cycle starts.
-        self._sustain_fan_boost: int = 0
-        self._sustain_progress_check: datetime | None = None
-        self._sustain_progress_temp: float | None = None
 
         self._decision_reason = "Starting up"
         self._last_room_temp: float | None = None
@@ -447,31 +343,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             restored_bias = _as_float_attr(attrs.get("downstream_sensor_bias"))
             if restored_bias is not None:
                 self._ds_bias_ema = restored_bias
-
-            # Restore sustain mode state — this is a learned property of
-            # the room's thermal envelope, so it should persist.
-            for mode, key in (
-                (HVACMode.HEAT, "sustain_heat_active"),
-                (HVACMode.COOL, "sustain_cool_active"),
-            ):
-                if attrs.get(key):
-                    self._sustain_active[mode] = True
-            for mode, key in (
-                (HVACMode.HEAT, "sustain_heat_decay_count"),
-                (HVACMode.COOL, "sustain_cool_decay_count"),
-            ):
-                restored_count = _as_float_attr(attrs.get(key))
-                if restored_count is not None:
-                    self._sustain_decay_count[mode] = int(restored_count)
-            for mode, key in (
-                (HVACMode.HEAT, "sustain_heat_confidence"),
-                (HVACMode.COOL, "sustain_cool_confidence"),
-            ):
-                restored_conf = _as_float_attr(attrs.get(key))
-                if restored_conf is not None:
-                    self._sustain_confidence[mode] = max(
-                        0.0, min(SUSTAIN_CONFIDENCE_MAX, restored_conf)
-                    )
 
         tracked = [self._source_temp, self._downstream]
         if self._source_humidity:
@@ -563,18 +434,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
         active = self._active_mode
         if active in (HVACMode.HEAT, HVACMode.COOL):
-            sustain_on = self._sustain_active.get(active, False)
-            if sustain_on and (self._last_error is not None and self._last_error == 0.0):
-                label = "Heating" if active == HVACMode.HEAT else "Cooling"
-                fan_note = (
-                    f", fan+{self._sustain_fan_boost}"
-                    if self._sustain_fan_boost
-                    else ", low fan"
-                )
-                return (
-                    f"Sustain {label} ({fan_note}, leaky room)",
-                    "mdi:radiator",
-                )
             if active == HVACMode.HEAT:
                 target = self._heat_target + self._overshoot[HVACMode.HEAT]
                 bits = [f"Heating → {target:.0f}°F"]
@@ -685,24 +544,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "recent_cool_starts": [
                 t.isoformat() for t in self._cycle_starts[HVACMode.COOL]
             ],
-            "sustain_heat_active": self._sustain_active[HVACMode.HEAT],
-            "sustain_cool_active": self._sustain_active[HVACMode.COOL],
-            "sustain_heat_decay_count": self._sustain_decay_count[HVACMode.HEAT],
-            "sustain_cool_decay_count": self._sustain_decay_count[HVACMode.COOL],
-            "sustain_fan_boost": self._sustain_fan_boost,
-            "sustain_heat_confidence": round(
-                self._sustain_confidence[HVACMode.HEAT], 2
-            ),
-            "sustain_cool_confidence": round(
-                self._sustain_confidence[HVACMode.COOL], 2
-            ),
-            "sustain_heat_predict": self._sustain_predict_flag[HVACMode.HEAT],
-            "sustain_cool_predict": self._sustain_predict_flag[HVACMode.COOL],
-            "sustain_last_cycle_duration_s": (
-                round(self._sustain_last_cycle_duration)
-                if self._sustain_last_cycle_duration is not None
-                else None
-            ),
         }
 
     # ------------------------------------------------------------------ user commands
@@ -882,75 +723,16 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     f"({self._start_measurement_delay}s)"
                 )
             if stopped:
-                # Sustain mode: instead of cycling off, keep running on
-                # low fan to maintain temperature in leaky rooms.
-                if self._sustain_active.get(desired, False):
-                    # Safety cap: if the sensor reads far past the target,
-                    # the sensor is likely reading supply air (vent-adjacent)
-                    # rather than room air. Force-exit sustain to stop
-                    # heating/cooling far beyond the desired range.
-                    if desired == HVACMode.HEAT:
-                        overshoot_past = room_temp - self._heat_target
-                    else:
-                        overshoot_past = self._cool_target - room_temp
-                    if overshoot_past > SUSTAIN_OVERSHOOT_EXIT:
-                        should_exit = True
-                        _LOGGER.warning(
-                            "Sustain safety cap for %s: sensor reads %.1f°F, "
-                            "which is %.1f°F past target (cap %.1f°F). "
-                            "Sensor may be reading supply air. Forcing exit.",
-                            desired.value,
-                            room_temp,
-                            overshoot_past,
-                            SUSTAIN_OVERSHOOT_EXIT,
-                        )
-                    else:
-                        should_exit = self._check_sustain_exit(room_temp, desired)
-                    if should_exit:
-                        self._sustain_active[desired] = False
-                        self._sustain_decay_count[desired] = 0
-                        self._reset_sustain_cycle_state()
-                        # Larger confidence decay when hitting the safety
-                        # cap — the sensor may not be suitable for sustain.
-                        if overshoot_past > SUSTAIN_OVERSHOOT_EXIT:
-                            confidence_penalty = SUSTAIN_CONFIDENCE_BUMP
-                        else:
-                            confidence_penalty = SUSTAIN_CONFIDENCE_EXIT_DECAY
-                        self._sustain_confidence[desired] = max(
-                            0.0,
-                            self._sustain_confidence[desired]
-                            - confidence_penalty,
-                        )
-                        _LOGGER.info(
-                            "Exiting sustain mode for %s: temp stable "
-                            "(confidence now %.2f)",
-                            desired.value,
-                            self._sustain_confidence[desired],
-                        )
-                        transition_reason = (
-                            f"Exiting sustain {desired.value.upper()}: "
-                            f"room {room_temp:.1f}°F stable, cycling off"
-                        )
-                        desired = None
-                    else:
-                        # Stay on — don't set desired = None.
-                        stopped = False
-                        transition_reason = (
-                            f"SUSTAIN {desired.value.upper()}: room "
-                            f"{room_temp:.1f}°F reached {stop_at:.1f}°F "
-                            f"but holding on low fan (leaky room detected)"
-                        )
-                else:
-                    overshoot_note = (
-                        f" (adaptive overshoot {overshoot:.1f}°F)"
-                        if overshoot > 0
-                        else ""
-                    )
-                    transition_reason = (
-                        f"Ending {desired.value.upper()}: room {room_temp:.1f}°F "
-                        f"reached stop {stop_at:.1f}°F{overshoot_note}"
-                    )
-                    desired = None
+                overshoot_note = (
+                    f" (adaptive overshoot {overshoot:.1f}°F)"
+                    if overshoot > 0
+                    else ""
+                )
+                transition_reason = (
+                    f"Ending {desired.value.upper()}: room {room_temp:.1f}°F "
+                    f"reached stop {stop_at:.1f}°F{overshoot_note}"
+                )
+                desired = None
 
         # Minimum cycle time gate — only blocks turning ON (idle → active or
         # switching between active modes). Turning OFF is always allowed.
@@ -975,35 +757,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
         if desired != self._active_mode:
             if self._active_mode is None and desired is not None:
-                # idle → active: check if the previous idle had rapid decay
-                # (or predicted flapping) before recording the new cycle start.
-                self._measure_decay_and_maybe_enter_sustain(desired)
                 self._record_cycle_start_and_adapt(desired)
-                self._sustain_cycle_start_temp = room_temp
-            prev_mode = self._active_mode
-            # Capture cycle duration before overwriting _last_transition.
-            if (
-                desired is None
-                and prev_mode in (HVACMode.HEAT, HVACMode.COOL)
-                and self._last_transition is not None
-            ):
-                self._sustain_last_cycle_duration = (
-                    dt_util.utcnow() - self._last_transition
-                ).total_seconds()
             self._active_mode = desired
             self._last_transition = dt_util.utcnow()
             if desired is None:
-                # active → idle: start decay tracking for predictive sustain.
-                if prev_mode in (HVACMode.HEAT, HVACMode.COOL):
-                    self._sustain_predict_flag[prev_mode] = False
-                    self._sustain_decay_ref_temp = room_temp
-                    self._sustain_decay_ref_time = dt_util.utcnow()
-                    self._sustain_decay_ref_mode = prev_mode
-                    self._sustain_decay_measured = False
-                # Reset sustain stability tracking on exit
-                self._sustain_stable_since = None
-                self._sustain_last_temp = None
-                self._sustain_last_temp_time = None
                 await self._async_stop_downstream()
                 self._attr_hvac_action = HVACAction.IDLE
                 self._last_error = 0.0
@@ -1021,10 +778,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             self._last_error = 0.0
             self._last_pushed_setpoint = None
             self._last_fan_tier = None
-            # Measure post-cycle decay while idle for sustain detection,
-            # and predict whether the next cycle will need sustain.
-            self._measure_idle_decay(room_temp)
-            self._predict_sustain_from_decay(room_temp)
             if ds_state.state != "off":
                 _LOGGER.warning(
                     "Downstream %s is %s while virtual device is idle; "
@@ -1095,391 +848,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._setpoint_boost = 0.0
         self._progress_last_check = None
         self._progress_last_error = None
-
-    # ------------------------------------------------------------------ sustain mode
-
-    def _predict_sustain_from_decay(self, room_temp: float) -> None:
-        """After a cycle ends, predict if the room will flap.
-
-        Called every tick while idle. Two paths:
-
-        **Immediate** (first tick): if the last cycle was short and barely
-        moved the room sensor, the room is just above the start threshold
-        and any cooling will restart it. Flag sustain with no observation.
-
-        **Observed** (after SUSTAIN_PREDICT_OBSERVE_S): for cycles with
-        larger gain (e.g., vent-adjacent sensor spikes), extrapolate the
-        measured decay rate to predict restart timing. If the predicted
-        full-cycle period is short, flag sustain.
-        """
-        if (
-            self._sustain_decay_ref_temp is None
-            or self._sustain_decay_ref_time is None
-            or self._sustain_decay_ref_mode is None
-        ):
-            return
-        mode = self._sustain_decay_ref_mode
-        if self._sustain_predict_flag.get(mode, False):
-            return  # already predicted for this idle period
-        if self._sustain_active.get(mode, False):
-            return  # already in sustain
-
-        cycle_dur = self._sustain_last_cycle_duration or float(self._min_cycle)
-
-        # How much did the last cycle actually move the room sensor?
-        cycle_gain = 0.0
-        if self._sustain_cycle_start_temp is not None:
-            if mode == HVACMode.HEAT:
-                cycle_gain = (
-                    self._sustain_decay_ref_temp
-                    - self._sustain_cycle_start_temp
-                )
-            else:
-                cycle_gain = (
-                    self._sustain_cycle_start_temp
-                    - self._sustain_decay_ref_temp
-                )
-
-        # ---- Path 1: immediate — short cycle + tiny gain ----
-        if (
-            cycle_gain < SUSTAIN_PREDICT_MIN_GAIN
-            and cycle_dur <= SUSTAIN_PREDICT_MAX_CYCLE_S
-        ):
-            # Also trigger if outdoor temp shows a large thermal gradient.
-            outdoor_temp = _as_float(
-                self.hass.states.get(self._outdoor_sensor)
-                if self._outdoor_sensor
-                else None
-            )
-            outdoor_note = ""
-            if outdoor_temp is not None:
-                if mode == HVACMode.HEAT:
-                    outdoor_delta = room_temp - outdoor_temp
-                else:
-                    outdoor_delta = outdoor_temp - room_temp
-                outdoor_note = f", outdoor delta {outdoor_delta:.0f}°F"
-
-            self._sustain_predict_flag[mode] = True
-            _LOGGER.info(
-                "Sustain predicted for %s (immediate): cycle was %.0fs "
-                "and gained only %.1f°F (< %.1f°F threshold)%s.",
-                mode.value,
-                cycle_dur,
-                cycle_gain,
-                SUSTAIN_PREDICT_MIN_GAIN,
-                outdoor_note,
-            )
-            return
-
-        # ---- Path 2: observed — larger gain, check decay rate ----
-        elapsed_s = (
-            dt_util.utcnow() - self._sustain_decay_ref_time
-        ).total_seconds()
-        if elapsed_s < SUSTAIN_PREDICT_OBSERVE_S:
-            return  # still observing
-
-        if mode == HVACMode.HEAT:
-            decay = self._sustain_decay_ref_temp - room_temp
-            start_threshold = self._heat_target - self._deadband
-            remaining = room_temp - start_threshold
-        else:
-            decay = room_temp - self._sustain_decay_ref_temp
-            start_threshold = self._cool_target + self._deadband
-            remaining = start_threshold - room_temp
-
-        if decay <= 0:
-            return  # room isn't decaying — no sustain needed
-
-        decay_rate = decay / (elapsed_s / 60.0)  # °F per minute
-
-        if remaining <= 0:
-            predicted_off_s = 0.0
-        else:
-            predicted_off_s = (remaining / decay_rate) * 60.0
-
-        predicted_period = cycle_dur + predicted_off_s
-
-        # Check outdoor temp — large gradient means decay will accelerate.
-        outdoor_temp = _as_float(
-            self.hass.states.get(self._outdoor_sensor)
-            if self._outdoor_sensor
-            else None
-        )
-        outdoor_delta: float | None = None
-        if outdoor_temp is not None:
-            if mode == HVACMode.HEAT:
-                outdoor_delta = room_temp - outdoor_temp
-            else:
-                outdoor_delta = outdoor_temp - room_temp
-
-        trigger = False
-        reason = ""
-        if predicted_period < SUSTAIN_PREDICT_MAX_PERIOD_S:
-            trigger = True
-            reason = (
-                f"predicted period {predicted_period / 60:.0f}min "
-                f"(< {SUSTAIN_PREDICT_MAX_PERIOD_S / 60:.0f}min)"
-            )
-        elif (
-            outdoor_delta is not None
-            and outdoor_delta > SUSTAIN_PREDICT_OUTDOOR_DELTA
-            and predicted_period < SUSTAIN_PREDICT_MAX_PERIOD_S * 1.5
-        ):
-            trigger = True
-            reason = (
-                f"outdoor delta {outdoor_delta:.0f}°F with predicted "
-                f"period {predicted_period / 60:.0f}min"
-            )
-
-        if trigger:
-            self._sustain_predict_flag[mode] = True
-            _LOGGER.info(
-                "Sustain predicted for %s (observed): %s. "
-                "Decay %.3f°F/min over %ds, predicted off %.0fs, "
-                "cycle was %.0fs (gain %.1f°F).",
-                mode.value,
-                reason,
-                decay_rate,
-                int(elapsed_s),
-                predicted_off_s,
-                cycle_dur,
-                cycle_gain,
-            )
-
-    def _reset_sustain_cycle_state(self) -> None:
-        """Reset within-sustain tracking state (on enter or exit)."""
-        self._sustain_fan_boost = 0
-        self._sustain_progress_check = None
-        self._sustain_progress_temp = None
-        self._sustain_stable_since = None
-
-    def _measure_idle_decay(self, room_temp: float) -> None:
-        """While idle, check if the post-cycle decay has been rapid.
-
-        Called every tick while idle. Once the decay window elapses, we
-        record whether this was a "rapid decay" cycle for the mode that
-        just ended.
-        """
-        if (
-            self._sustain_decay_measured
-            or self._sustain_decay_ref_temp is None
-            or self._sustain_decay_ref_time is None
-            or self._sustain_decay_ref_mode is None
-        ):
-            return
-
-        elapsed = (
-            dt_util.utcnow() - self._sustain_decay_ref_time
-        ).total_seconds()
-        if elapsed < SUSTAIN_DECAY_WINDOW_S:
-            return
-
-        # Window has elapsed — measure the decay.
-        self._sustain_decay_measured = True
-        ref_mode = self._sustain_decay_ref_mode
-
-        if ref_mode == HVACMode.HEAT:
-            decay = self._sustain_decay_ref_temp - room_temp
-        else:
-            decay = room_temp - self._sustain_decay_ref_temp
-
-        if decay >= SUSTAIN_DECAY_THRESHOLD:
-            self._sustain_decay_count[ref_mode] = (
-                self._sustain_decay_count.get(ref_mode, 0) + 1
-            )
-            # Rapid decay reinforces confidence that this room needs sustain.
-            self._sustain_confidence[ref_mode] = min(
-                SUSTAIN_CONFIDENCE_MAX,
-                self._sustain_confidence[ref_mode] + SUSTAIN_CONFIDENCE_BUMP,
-            )
-            _LOGGER.info(
-                "Rapid decay detected for %s: %.1f°F in %ds "
-                "(count now %d/%d for sustain, confidence %.2f)",
-                ref_mode.value,
-                decay,
-                int(elapsed),
-                self._sustain_decay_count[ref_mode],
-                SUSTAIN_TRIGGER_CYCLES,
-                self._sustain_confidence[ref_mode],
-            )
-        else:
-            # Non-rapid decay resets the counter — conditions improved.
-            # Decay confidence: room held temp, maybe conditions changed.
-            if self._sustain_decay_count.get(ref_mode, 0) > 0:
-                _LOGGER.info(
-                    "Slow decay for %s (%.1f°F in %ds), "
-                    "resetting sustain counter",
-                    ref_mode.value,
-                    decay,
-                    int(elapsed),
-                )
-            self._sustain_decay_count[ref_mode] = 0
-            self._sustain_confidence[ref_mode] = max(
-                0.0,
-                self._sustain_confidence[ref_mode] - SUSTAIN_CONFIDENCE_GOOD_DECAY,
-            )
-
-    def _measure_decay_and_maybe_enter_sustain(self, mode: HVACMode) -> None:
-        """Called on idle → active transition. Check if we should enter sustain.
-
-        If the previous idle period had a rapid decay (already measured by
-        _measure_idle_decay) OR if the decay window hasn't elapsed yet but
-        the decay so far already exceeds the threshold, we count it.
-        """
-        if (
-            self._sustain_decay_ref_temp is not None
-            and self._sustain_decay_ref_mode == mode
-            and not self._sustain_decay_measured
-        ):
-            # Decay window hasn't elapsed — check early.
-            room_temp = self._last_room_temp
-            if room_temp is not None:
-                if mode == HVACMode.HEAT:
-                    decay = self._sustain_decay_ref_temp - room_temp
-                else:
-                    decay = room_temp - self._sustain_decay_ref_temp
-                if decay >= SUSTAIN_DECAY_THRESHOLD:
-                    self._sustain_decay_count[mode] = (
-                        self._sustain_decay_count.get(mode, 0) + 1
-                    )
-                    _LOGGER.info(
-                        "Early rapid decay for %s: %.1f°F before window ended "
-                        "(count now %d/%d)",
-                        mode.value,
-                        decay,
-                        self._sustain_decay_count[mode],
-                        SUSTAIN_TRIGGER_CYCLES,
-                    )
-                else:
-                    self._sustain_decay_count[mode] = 0
-
-        # Check if we should enter sustain mode — either by detection
-        # (enough consecutive rapid-decay cycles) or by confidence
-        # (this room has a strong history of needing sustain).
-        if not self._sustain_active.get(mode, False):
-            confidence = self._sustain_confidence.get(mode, 0.0)
-            decay_count = self._sustain_decay_count.get(mode, 0)
-            if decay_count >= SUSTAIN_TRIGGER_CYCLES:
-                self._sustain_active[mode] = True
-                self._reset_sustain_cycle_state()
-                _LOGGER.warning(
-                    "Entering SUSTAIN mode for %s: %d consecutive rapid-decay "
-                    "cycles detected (confidence %.2f)",
-                    mode.value,
-                    decay_count,
-                    confidence,
-                )
-            elif confidence >= SUSTAIN_CONFIDENCE_PREEMPT:
-                self._sustain_active[mode] = True
-                self._reset_sustain_cycle_state()
-                _LOGGER.warning(
-                    "Entering SUSTAIN mode for %s preemptively: "
-                    "confidence %.2f >= %.2f (learned leaky room)",
-                    mode.value,
-                    confidence,
-                    SUSTAIN_CONFIDENCE_PREEMPT,
-                )
-            elif self._sustain_predict_flag.get(mode, False):
-                self._sustain_active[mode] = True
-                self._reset_sustain_cycle_state()
-                self._sustain_predict_flag[mode] = False
-                _LOGGER.warning(
-                    "Entering SUSTAIN mode for %s: predicted flapping "
-                    "after single cycle (last cycle %.0fs, gained %.1f°F). "
-                    "Confidence %.2f",
-                    mode.value,
-                    self._sustain_last_cycle_duration or 0,
-                    (
-                        (self._sustain_decay_ref_temp or 0)
-                        - (self._sustain_cycle_start_temp or 0)
-                    )
-                    if mode == HVACMode.HEAT
-                    else (
-                        (self._sustain_cycle_start_temp or 0)
-                        - (self._sustain_decay_ref_temp or 0)
-                    ),
-                    confidence,
-                )
-
-    def _check_sustain_exit(self, room_temp: float, mode: HVACMode) -> bool:
-        """Return True if temp has been stable long enough to exit sustain."""
-        now = dt_util.utcnow()
-        if self._sustain_stable_since is None:
-            self._sustain_stable_since = now
-            self._sustain_last_temp = room_temp
-            self._sustain_last_temp_time = now
-            return False
-
-        # Check rate of change since last sample.
-        if self._sustain_last_temp is not None and self._sustain_last_temp_time is not None:
-            dt_s = (now - self._sustain_last_temp_time).total_seconds()
-            if dt_s > 0:
-                rate = abs(room_temp - self._sustain_last_temp) / (dt_s / 60.0)
-                if rate > SUSTAIN_STABLE_RATE:
-                    # Not stable yet — reset the window.
-                    self._sustain_stable_since = now
-
-        self._sustain_last_temp = room_temp
-        self._sustain_last_temp_time = now
-
-        stable_duration = (now - self._sustain_stable_since).total_seconds()
-        return stable_duration >= SUSTAIN_STABLE_WINDOW_S
-
-    def _update_sustain_stability(self, room_temp: float, mode: HVACMode) -> None:
-        """Track temp stability while in sustain hold mode."""
-        now = dt_util.utcnow()
-        if self._sustain_stable_since is None:
-            self._sustain_stable_since = now
-            self._sustain_last_temp = room_temp
-            self._sustain_last_temp_time = now
-            return
-
-        if self._sustain_last_temp is not None and self._sustain_last_temp_time is not None:
-            dt_s = (now - self._sustain_last_temp_time).total_seconds()
-            if dt_s > 0:
-                rate = abs(room_temp - self._sustain_last_temp) / (dt_s / 60.0)
-                if rate > SUSTAIN_STABLE_RATE:
-                    self._sustain_stable_since = now
-
-        self._sustain_last_temp = room_temp
-        self._sustain_last_temp_time = now
-
-    def _check_sustain_fan_escalation(self, room_temp: float, mode: HVACMode) -> None:
-        """While in sustain hold, escalate fan if the room is losing ground.
-
-        Uses the same FAN_PROGRESS_INTERVAL_S window as normal stall
-        detection. If the temp has moved in the wrong direction (heat:
-        dropped, cool: risen) over the window, bump the sustain fan boost.
-        """
-        now = dt_util.utcnow()
-        if self._sustain_progress_check is None:
-            self._sustain_progress_check = now
-            self._sustain_progress_temp = room_temp
-            return
-
-        elapsed = (now - self._sustain_progress_check).total_seconds()
-        if elapsed < FAN_PROGRESS_INTERVAL_S:
-            return
-
-        prev = self._sustain_progress_temp or room_temp
-        if mode == HVACMode.HEAT:
-            losing = room_temp < prev - 0.25  # dropping while heating
-        else:
-            losing = room_temp > prev + 0.25  # rising while cooling
-
-        if losing and self._sustain_fan_boost < FAN_BOOST_MAX:
-            self._sustain_fan_boost += 1
-            _LOGGER.info(
-                "Sustain fan escalation for %s: temp moved from %.1f to %.1f, "
-                "boost now %d",
-                mode.value,
-                prev,
-                room_temp,
-                self._sustain_fan_boost,
-            )
-
-        self._sustain_progress_check = now
-        self._sustain_progress_temp = room_temp
 
     # ------------------------------------------------------------------ room sensor lost
 
@@ -1707,30 +1075,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
         fan_mode = self._pick_fan_mode(error, available_fan, self._fan_boost)
 
-        # ---- Sustain mode override: in sustain, we avoid blast-and-coast
-        # by capping the fan to the sustain boost level (starts at 0 =
-        # lowest tier, escalates only when the room can't hold temp).
-        # During ramp-up (error > 0): cap fan at sustain boost level.
-        # At target (error == 0): hold on sustain fan and track stability.
-        sustain_holding = False
-        if self._sustain_active.get(mode, False):
-            # Cap fan speed to sustain level for both ramp and hold.
-            fan_mode = self._pick_fan_mode(
-                0.0, available_fan, self._sustain_fan_boost
-            )
-            if error == 0.0:
-                sustain_holding = True
-                # Check if we need to escalate fan within sustain.
-                self._check_sustain_fan_escalation(room_temp, mode)
-                # Gentle setpoint: just offset from target, no boost/bias.
-                if mode == HVACMode.COOL:
-                    raw_setpoint = self._cool_target - self._offset
-                else:
-                    raw_setpoint = self._heat_target + self._offset
-                setpoint = self._clamp(raw_setpoint, ds_min, ds_max, ds_step)
-                # Track stability for exit detection.
-                self._update_sustain_stability(room_temp, mode)
-
         self._last_error = error
         self._last_pushed_setpoint = setpoint
         self._last_fan_tier = fan_mode
@@ -1763,21 +1107,13 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             if self._fan_boost:
                 parts.append(f"fan +{self._fan_boost}")
             boost_note = f" Stall boosts: {', '.join(parts)}."
-        sustain_note = ""
-        if sustain_holding:
-            fan_info = (
-                f"fan+{self._sustain_fan_boost}"
-                if self._sustain_fan_boost
-                else "low fan"
-            )
-            sustain_note = f" SUSTAIN: holding on {fan_info} (leaky room)."
 
         return (
             f"{mode.value.upper()}ING: room {room_temp:.1f}°F, {target_label}, "
             f"error {error:.1f}°F. Pushing downstream setpoint to "
             f"{setpoint:.0f}°F (target {offset_sign} {self._offset:.0f}°F offset, "
             f"clamped to {ds_min:.0f}–{ds_max:.0f}). "
-            f"Fan tier: {fan_mode or 'n/a'}.{bias_note}{boost_note}{sustain_note} {stop_label}."
+            f"Fan tier: {fan_mode or 'n/a'}.{bias_note}{boost_note} {stop_label}."
         )
 
     async def _async_send(
