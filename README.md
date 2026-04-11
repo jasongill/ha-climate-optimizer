@@ -49,6 +49,15 @@ Once setpoint boost is exhausted and progress is *still* stalled, the chosen fan
 
 Both within-cycle boosts reset on every new cycle.
 
+### Sustain mode (rapid-cycling escape hatch)
+Some rooms short-cycle no matter how the bang-bang loop is tuned — a sensor too close to the vent spikes on airflow, or the envelope leaks faster than a normal cycle can keep up. Sustain mode detects this purely from the user's own `min_cycle_time` setting: if the last two gaps between cycle starts of the same mode are each within `2×` of `min_cycle_time`, the unit is cycling too fast by the user's own definition and sustain activates for that mode.
+
+In sustain, the compressor stays engaged continuously and **fan tier becomes the proportional control variable**. A slow walker steps the fan tier up when the room drops below target and down when it rises above, no faster than once every `2 min` to avoid audible jitter. The setpoint is held at `target ± offset` with no boost or bias push — inverters naturally modulate their output based on the perceived delta, so lower fan really does mean less heat delivered.
+
+**Exit is drift-based**, no probing. Once the fan has been parked at its minimum tier for `10 min`, the integration fits a slope over the last `10 min` of room temperatures. If the room is on the safe side of target *and* drifting further that way (heat: above target and rising; cool: below target and falling) at ≥ `0.02°F/min`, ambient conditions are doing the work — sustain exits and the normal loop takes over.
+
+The sustain-preferred state is remembered per mode and persists across restarts, so a room that's been in sustain will re-enter immediately on the next cycle rather than waiting to re-detect the rapid pattern. The preference is cleared on a drift-exit, so memory is self-correcting across seasons.
+
 ### Visibility
 Every adaptive value is exposed as an entity attribute so you can see exactly what the system has learned and why it's doing what it's doing:
 
@@ -62,6 +71,9 @@ Every adaptive value is exposed as an entity attribute so you can see exactly wh
 | `setpoint_boost` | Current within-cycle setpoint push (resets per cycle) |
 | `fan_boost` | Current within-cycle fan-tier escalation (resets per cycle) |
 | `recent_heat_starts` / `recent_cool_starts` | Recent cycle start timestamps used by the overshoot logic |
+| `sustain_heat_active` / `sustain_cool_active` | Whether sustain mode is currently engaged per mode |
+| `sustain_heat_preferred` / `sustain_cool_preferred` | Learned preference that this mode enters sustain automatically |
+| `sustain_fan_tier_idx` | Current fan tier index while in sustain |
 
 ## Configuration
 
