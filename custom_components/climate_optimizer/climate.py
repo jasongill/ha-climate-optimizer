@@ -37,6 +37,13 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
+try:
+    from homeassistant.components.recorder import get_instance as _recorder_get_instance
+    from homeassistant.components.recorder.history import get_significant_states as _get_significant_states
+    _RECORDER_AVAILABLE = True
+except ImportError:
+    _RECORDER_AVAILABLE = False
+
 from .const import (
     CONF_AREA_ID,
     CONF_COOL_TARGET,
@@ -132,19 +139,27 @@ BIAS_STALE_ROOM_DELTA = 1.0
 
 
 # Sustain mode: some rooms (vent-adjacent sensors, leaky envelopes) cause
-# the normal bang-bang loop to short-cycle — the sensor spikes on airflow,
+# the normal bang-bang loop to oscillate — the sensor spikes on airflow,
 # tripping the stop threshold before the room mass actually moves, and then
-# the room cools back across the deadband within minutes. Sustain mode
+# the room cools back across the deadband before repeating. Sustain mode
 # replaces the on/off cycling with a continuous-run "modulated hold" where
 # the compressor stays engaged and fan tier is the proportional control
 # variable.
 #
-# Detection is purely relative: if the most recent RAPID_GAPS_REQUIRED
-# gaps between cycle starts are each <= min_cycle_time × RAPID_GAP_RATIO,
-# the user's own min-cycle setting tells us these are "rapid" by their
-# definition. No calibration, no absolute thresholds.
-RAPID_GAP_RATIO = 2.0
-RAPID_GAPS_REQUIRED = 2
+# Detection is signal-based: maintain a rolling 3-hour buffer of room
+# temperature readings (seeded from the HA recorder on startup) and look
+# for an alternating sawtooth pattern — distinct excursions above the spike
+# threshold interleaved with returns below the start threshold. This fires
+# regardless of how long cycles take: a 10-minute cycle and a 60-minute
+# cycle produce the same alternating zone-entry pattern.
+#
+# SAWTOOTH_SPIKE_FLOOR: how far above heat_target (or below cool_target)
+# a peak must reach to count as a "spike excursion." Set equal to
+# ADAPTIVE_MAX so any temperature beyond the ceiling of what adaptive
+# overshoot can legitimately produce is definitionally a sensor spike.
+SAWTOOTH_WINDOW_S = 3 * 60 * 60   # look back 3 hours
+SAWTOOTH_SPIKE_FLOOR = ADAPTIVE_MAX  # °F beyond target = spike zone threshold
+SAWTOOTH_MIN_ALTERNATIONS = 2      # require this many spikes AND returns
 
 # In-sustain control loop. The fan tier walks up/down one step at a time
 # no faster than SUSTAIN_FAN_STEP_INTERVAL_S apart, to avoid audible
@@ -320,8 +335,14 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._ds_last_change_room_temp: float | None = None
         self._ds_stale: bool = False
 
+        # Rolling room-temperature history for sawtooth detection.
+        # Each entry is (timestamp, °F). Seeded from the HA recorder on
+        # startup so the detector works immediately without waiting for
+        # fresh cycles. Trimmed to SAWTOOTH_WINDOW_S on every append.
+        self._temp_history: list[tuple[datetime, float]] = []
+
         # Sustain mode — continuous modulated hold for rooms whose
-        # cycle-rate detection says they can't bang-bang cleanly.
+        # temperature history shows a repeating sawtooth oscillation.
         # _preferred persists across restarts so a freshly-started HA
         # enters sustain on the first cycle of the remembered mode;
         # the drift-exit logic will kick it back out if conditions no
@@ -331,6 +352,20 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             HVACMode.COOL: False,
         }
         self._sustain_preferred: dict[HVACMode, bool] = {
+            HVACMode.HEAT: False,
+            HVACMode.COOL: False,
+        }
+        # Timestamp of the last drift-exit per mode. _detect_sawtooth
+        # clamps its window to this time so stale pre-sustain spikes
+        # cannot immediately re-trigger sustain after a drift-exit.
+        self._sustain_exited_at: dict[HVACMode, datetime | None] = {
+            HVACMode.HEAT: None,
+            HVACMode.COOL: None,
+        }
+        # Cached result of the most recent _detect_sawtooth call per mode,
+        # updated in the per-tick sawtooth check and read by the attributes
+        # property to avoid running the detection twice per state write.
+        self._sawtooth_detected: dict[HVACMode, bool] = {
             HVACMode.HEAT: False,
             HVACMode.COOL: False,
         }
@@ -407,6 +442,34 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             ):
                 if attrs.get(key):
                     self._sustain_preferred[mode] = True
+
+        # Seed the temperature history buffer from the recorder so sawtooth
+        # detection works immediately after a restart, not just after
+        # observing fresh cycles.
+        if _RECORDER_AVAILABLE:
+            try:
+                start = dt_util.utcnow() - timedelta(seconds=SAWTOOTH_WINDOW_S)
+                history_map = await _recorder_get_instance(
+                    self.hass
+                ).async_add_executor_job(
+                    _get_significant_states,
+                    self.hass,
+                    start,
+                    None,
+                    [self._source_temp],
+                )
+                for state in history_map.get(self._source_temp, []):
+                    v = _as_float(state)
+                    if v is not None:
+                        self._temp_history.append((state.last_changed, v))
+                _LOGGER.debug(
+                    "Seeded temp history with %d samples from recorder",
+                    len(self._temp_history),
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Could not seed temp history from recorder", exc_info=True
+                )
 
         tracked = [self._source_temp, self._downstream]
         if self._source_humidity:
@@ -629,6 +692,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "sustain_heat_preferred": self._sustain_preferred[HVACMode.HEAT],
             "sustain_cool_preferred": self._sustain_preferred[HVACMode.COOL],
             "sustain_fan_tier_idx": self._sustain_fan_idx,
+            "sawtooth_heat_detected": self._sawtooth_detected[HVACMode.HEAT],
+            "sawtooth_cool_detected": self._sawtooth_detected[HVACMode.COOL],
+            "temp_history_samples": len(self._temp_history),
         }
 
     # ------------------------------------------------------------------ user commands
@@ -759,6 +825,34 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 ds_state, allow_heat, allow_cool, stale=room_sensor_stale
             )
             return
+
+        # Maintain rolling temperature history for sawtooth detection.
+        # Use the sensor's own last_changed timestamp so that rapid ticks
+        # don't create duplicate entries and timestamps are accurate.
+        if room_state is not None:
+            ts = room_state.last_changed
+            if not self._temp_history or self._temp_history[-1][0] != ts:
+                self._temp_history.append((ts, room_temp))
+                cutoff = dt_util.utcnow() - timedelta(seconds=SAWTOOTH_WINDOW_S)
+                while self._temp_history and self._temp_history[0][0] < cutoff:
+                    self._temp_history.pop(0)
+
+        # Sawtooth detection: check each allowed mode every tick. If the
+        # temperature history shows the alternating spike/return pattern,
+        # enter sustain now — before the normal bang-bang logic runs — so
+        # the very next cycle (or the current one) is already in sustain.
+        for _st_mode in (HVACMode.HEAT, HVACMode.COOL):
+            if _st_mode == HVACMode.HEAT and not allow_heat:
+                continue
+            if _st_mode == HVACMode.COOL and not allow_cool:
+                continue
+            detected = self._detect_sawtooth(_st_mode)
+            self._sawtooth_detected[_st_mode] = detected
+            if not self._sustain_active.get(_st_mode, False) and detected:
+                self._enter_sustain(
+                    _st_mode,
+                    reason="sawtooth oscillation detected in temperature history",
+                )
 
         self._emergency_active = False
 
@@ -970,31 +1064,76 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._setpoint_boost = 0.0
         self._progress_last_check = None
         self._progress_last_error = None
-
-        # Rapid-cycling detection — purely relative to the user's own
-        # min_cycle_time setting. If the most recent RAPID_GAPS_REQUIRED
-        # gaps between cycle starts are all below the rapid threshold,
-        # enter sustain for this mode.
-        if not self._sustain_active.get(mode, False) and len(history) >= (
-            RAPID_GAPS_REQUIRED + 1
-        ):
-            rapid_limit = self._min_cycle * RAPID_GAP_RATIO
-            recent_gaps = [
-                (history[i] - history[i - 1]).total_seconds()
-                for i in range(len(history) - RAPID_GAPS_REQUIRED, len(history))
-            ]
-            if all(g <= rapid_limit for g in recent_gaps):
-                gap_str = ", ".join(f"{g:.0f}s" for g in recent_gaps)
-                self._enter_sustain(
-                    mode,
-                    reason=(
-                        f"detected rapid cycling (gaps {gap_str}, "
-                        f"limit {rapid_limit:.0f}s = {RAPID_GAP_RATIO}× "
-                        f"min_cycle_time {self._min_cycle}s)"
-                    ),
-                )
+        # Sustain detection is now handled by _detect_sawtooth(), which
+        # runs every tick against the rolling temperature history buffer.
+        # No per-cycle gap/duration tracking needed here.
 
     # ------------------------------------------------------------------ sustain mode
+
+    def _detect_sawtooth(self, mode: HVACMode) -> bool:
+        """Return True if the temperature history shows a sawtooth pattern.
+
+        A sawtooth is identified by at least SAWTOOTH_MIN_ALTERNATIONS distinct
+        excursions into the "spike zone" (significantly past target in the
+        active direction) interleaved with returns into the "valley zone"
+        (back past the start threshold in the other direction).
+
+        The check is purely zone-based — no timing thresholds — so it fires
+        at the same sensitivity for fast (8-min) or slow (60-min) cycles.
+        """
+        now = dt_util.utcnow()
+        window_start = now - timedelta(seconds=SAWTOOTH_WINDOW_S)
+        # Don't look at data from before the last drift-exit. Without this,
+        # pre-sustain spikes still in the buffer would immediately re-trigger
+        # sustain after drift-exit, creating an exit → re-enter loop. Only
+        # fresh post-exit oscillations can justify re-entering.
+        exited_at = self._sustain_exited_at.get(mode)
+        if exited_at is not None and exited_at > window_start:
+            window_start = exited_at
+        samples = [(t, v) for t, v in self._temp_history if t >= window_start]
+        if len(samples) < 5:
+            return False
+
+        temps = [v for _, v in samples]
+
+        if mode == HVACMode.HEAT:
+            # spike zone: far above heat_target (sensor being blasted with warm air)
+            # return zone: below heat_target − deadband (room cooled back to start threshold)
+            def in_spike(v: float) -> bool:
+                return v >= self._heat_target + SAWTOOTH_SPIKE_FLOOR
+
+            def in_return(v: float) -> bool:
+                return v <= self._heat_target - self._deadband
+        else:
+            # Cool: mirror image — spike zone is far below cool_target
+            def in_spike(v: float) -> bool:
+                return v <= self._cool_target - SAWTOOTH_SPIKE_FLOOR
+
+            def in_return(v: float) -> bool:
+                return v >= self._cool_target + self._deadband
+
+        # Walk the series and count distinct zone-entry transitions.
+        # Middle-zone samples (between the two thresholds) don't reset
+        # the current zone, so a gradual crossing doesn't double-count.
+        spikes = 0
+        returns = 0
+        current_zone: str | None = None  # 'spike' | 'return' | None
+
+        for v in temps:
+            if in_spike(v):
+                if current_zone != "spike":
+                    spikes += 1
+                    current_zone = "spike"
+            elif in_return(v):
+                if current_zone != "return":
+                    returns += 1
+                    current_zone = "return"
+            # else: middle zone — keep current_zone unchanged
+
+        return (
+            spikes >= SAWTOOTH_MIN_ALTERNATIONS
+            and returns >= SAWTOOTH_MIN_ALTERNATIONS
+        )
 
     def _enter_sustain(self, mode: HVACMode, *, reason: str) -> None:
         """Flip a mode into sustain and reset per-session state."""
@@ -1406,6 +1545,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         if exit_sustain:
             self._sustain_active[mode] = False
             self._sustain_preferred[mode] = False
+            self._sustain_exited_at[mode] = now
             _LOGGER.info(
                 "Exiting SUSTAIN for %s: ambient drift is doing the work "
                 "(fan at tier 0 for >= %ds, slope safe).",
