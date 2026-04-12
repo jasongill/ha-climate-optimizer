@@ -1337,6 +1337,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             t for t in self._fan_tiers if t["fan_mode"] in available_fan
         ]
         max_idx = max(0, len(usable_tiers) - 1)
+        # Clamp in case usable_tiers shrank since the last tick (e.g., the
+        # downstream briefly lost its fan mode list).
+        self._sustain_fan_idx = min(self._sustain_fan_idx, max_idx)
 
         # ---- Fan tier walker. Step by one, rate-limited.
         can_step = (
@@ -1434,6 +1437,25 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         cur_mode = ds_state.state
         cur_setpoint = ds_state.attributes.get(ATTR_TEMPERATURE)
         cur_fan = ds_state.attributes.get(ATTR_FAN_MODE)
+
+        # If the downstream's actual state disagrees with what we last sent,
+        # something external changed it (remote, cloud, timeout). Clear the
+        # dedup cache so we re-assert our desired state, and reset the stall
+        # progress clock so we don't immediately escalate boost on recovery.
+        if (
+            self._last_sent.get("hvac_mode") is not None
+            and cur_mode != self._last_sent["hvac_mode"]
+        ):
+            _LOGGER.warning(
+                "Downstream %s drifted to '%s' (expected '%s'); "
+                "re-asserting control",
+                self._downstream,
+                cur_mode,
+                self._last_sent["hvac_mode"],
+            )
+            self._last_sent = {}
+            self._progress_last_check = None
+            self._progress_last_error = None
 
         if cur_mode != desired_hvac and self._last_sent.get("hvac_mode") != desired_hvac:
             await self.hass.services.async_call(
