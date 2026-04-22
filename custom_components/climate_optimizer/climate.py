@@ -37,13 +37,6 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
-try:
-    from homeassistant.components.recorder import get_instance as _recorder_get_instance
-    from homeassistant.components.recorder.history import get_significant_states as _get_significant_states
-    _RECORDER_AVAILABLE = True
-except ImportError:
-    _RECORDER_AVAILABLE = False
-
 from .const import (
     CONF_AREA_ID,
     CONF_COOL_TARGET,
@@ -59,6 +52,7 @@ from .const import (
     CONF_MIN_CYCLE_TIME,
     CONF_OUTDOOR_TEMP_SENSOR,
     CONF_ROOM_SENSOR_STALE_MINUTES,
+    CONF_ROOM_SENSOR_STUCK_HOURS,
     CONF_SETPOINT_OFFSET,
     CONF_SOURCE_HUMIDITY_SENSOR,
     CONF_SOURCE_TEMP_SENSOR,
@@ -75,6 +69,7 @@ from .const import (
     DEFAULT_HEAT_TARGET,
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_ROOM_SENSOR_STALE_MINUTES,
+    DEFAULT_ROOM_SENSOR_STUCK_HOURS,
     DEFAULT_SETPOINT_OFFSET,
     DEFAULT_START_MEASUREMENT_DELAY,
     DEFAULT_TICK_INTERVAL,
@@ -136,46 +131,6 @@ BIAS_MAX_COMPENSATION = 10.0
 # don't poison it with frozen data.
 BIAS_STALE_AFTER_S = 10 * 60
 BIAS_STALE_ROOM_DELTA = 1.0
-
-
-# Sustain mode: some rooms (vent-adjacent sensors, leaky envelopes) cause
-# the normal bang-bang loop to oscillate — the sensor spikes on airflow,
-# tripping the stop threshold before the room mass actually moves, and then
-# the room cools back across the deadband before repeating. Sustain mode
-# replaces the on/off cycling with a continuous-run "modulated hold" where
-# the compressor stays engaged and fan tier is the proportional control
-# variable.
-#
-# Detection is signal-based: maintain a rolling 3-hour buffer of room
-# temperature readings (seeded from the HA recorder on startup) and look
-# for an alternating sawtooth pattern — distinct excursions above the spike
-# threshold interleaved with returns below the start threshold. This fires
-# regardless of how long cycles take: a 10-minute cycle and a 60-minute
-# cycle produce the same alternating zone-entry pattern.
-#
-# SAWTOOTH_SPIKE_FLOOR: how far above heat_target (or below cool_target)
-# a peak must reach to count as a "spike excursion." Set equal to
-# ADAPTIVE_MAX so any temperature beyond the ceiling of what adaptive
-# overshoot can legitimately produce is definitionally a sensor spike.
-SAWTOOTH_WINDOW_S = 3 * 60 * 60   # look back 3 hours
-SAWTOOTH_SPIKE_FLOOR = ADAPTIVE_MAX  # °F beyond target = spike zone threshold
-SAWTOOTH_MIN_ALTERNATIONS = 2      # require this many spikes AND returns
-
-# In-sustain control loop. The fan tier walks up/down one step at a time
-# no faster than SUSTAIN_FAN_STEP_INTERVAL_S apart, to avoid audible
-# jitter. Deadband around target inside which the fan tier is held.
-SUSTAIN_FAN_STEP_INTERVAL_S = 2 * 60
-SUSTAIN_FAN_DEADBAND = 0.3
-
-# Drift-based exit. Once the sustain fan has been parked at its minimum
-# tier for SUSTAIN_MIN_FAN_HOLD_S, measure the room's slope over the last
-# SUSTAIN_DRIFT_WINDOW_S. If the room is on the "safe" side of target AND
-# drifting further in the safe direction at > SUSTAIN_DRIFT_EXIT_RATE
-# °F/min, ambient conditions are doing our job — exit sustain and let the
-# normal loop shut the unit off.
-SUSTAIN_MIN_FAN_HOLD_S = 10 * 60
-SUSTAIN_DRIFT_WINDOW_S = 10 * 60
-SUSTAIN_DRIFT_EXIT_RATE = 0.02  # °F/min — gentle trend is enough
 
 
 async def async_setup_entry(
@@ -275,6 +230,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             int(cfg.get(CONF_ROOM_SENSOR_STALE_MINUTES, DEFAULT_ROOM_SENSOR_STALE_MINUTES))
             * 60
         )
+        self._room_sensor_stuck_s = (
+            int(cfg.get(CONF_ROOM_SENSOR_STUCK_HOURS, DEFAULT_ROOM_SENSOR_STUCK_HOURS))
+            * 3600
+        )
         self._fan_tiers = _build_fan_tiers(cfg)
 
         self._emergency_enable = bool(
@@ -335,51 +294,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._ds_last_change_room_temp: float | None = None
         self._ds_stale: bool = False
 
-        # Rolling room-temperature history for sawtooth detection.
-        # Each entry is (timestamp, °F). Seeded from the HA recorder on
-        # startup so the detector works immediately without waiting for
-        # fresh cycles. Trimmed to SAWTOOTH_WINDOW_S on every append.
-        self._temp_history: list[tuple[datetime, float]] = []
-
-        # Sustain mode — continuous modulated hold for rooms whose
-        # temperature history shows a repeating sawtooth oscillation.
-        # _preferred persists across restarts so a freshly-started HA
-        # enters sustain on the first cycle of the remembered mode;
-        # the drift-exit logic will kick it back out if conditions no
-        # longer warrant it.
-        self._sustain_active: dict[HVACMode, bool] = {
-            HVACMode.HEAT: False,
-            HVACMode.COOL: False,
-        }
-        self._sustain_preferred: dict[HVACMode, bool] = {
-            HVACMode.HEAT: False,
-            HVACMode.COOL: False,
-        }
-        # Timestamp of the last drift-exit per mode. _detect_sawtooth
-        # clamps its window to this time so stale pre-sustain spikes
-        # cannot immediately re-trigger sustain after a drift-exit.
-        self._sustain_exited_at: dict[HVACMode, datetime | None] = {
-            HVACMode.HEAT: None,
-            HVACMode.COOL: None,
-        }
-        # Cached result of the most recent _detect_sawtooth call per mode,
-        # updated in the per-tick sawtooth check and read by the attributes
-        # property to avoid running the detection twice per state write.
-        self._sawtooth_detected: dict[HVACMode, bool] = {
-            HVACMode.HEAT: False,
-            HVACMode.COOL: False,
-        }
-        # Current fan tier index while in sustain, and the timestamp of
-        # the last tier change (rate-limits the walker).
-        self._sustain_fan_idx: int = 0
-        self._sustain_last_fan_change: datetime | None = None
-        # Timestamp when fan first reached tier 0 during this sustain
-        # session; cleared on any upward tier change. Used to gate the
-        # drift-based exit.
-        self._sustain_min_fan_since: datetime | None = None
-        # Rolling room-temp samples (time, temp) for drift slope fit.
-        self._sustain_samples: list[tuple[datetime, float]] = []
-
         self._decision_reason = "Starting up"
         self._last_room_temp: float | None = None
         self._last_error: float | None = None
@@ -435,41 +349,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             restored_bias = _as_float_attr(attrs.get("downstream_sensor_bias"))
             if restored_bias is not None:
                 self._ds_bias_ema = restored_bias
-
-            for mode, key in (
-                (HVACMode.HEAT, "sustain_heat_preferred"),
-                (HVACMode.COOL, "sustain_cool_preferred"),
-            ):
-                if attrs.get(key):
-                    self._sustain_preferred[mode] = True
-
-        # Seed the temperature history buffer from the recorder so sawtooth
-        # detection works immediately after a restart, not just after
-        # observing fresh cycles.
-        if _RECORDER_AVAILABLE:
-            try:
-                start = dt_util.utcnow() - timedelta(seconds=SAWTOOTH_WINDOW_S)
-                history_map = await _recorder_get_instance(
-                    self.hass
-                ).async_add_executor_job(
-                    _get_significant_states,
-                    self.hass,
-                    start,
-                    None,
-                    [self._source_temp],
-                )
-                for state in history_map.get(self._source_temp, []):
-                    v = _as_float(state)
-                    if v is not None:
-                        self._temp_history.append((state.last_changed, v))
-                _LOGGER.debug(
-                    "Seeded temp history with %d samples from recorder",
-                    len(self._temp_history),
-                )
-            except Exception:  # noqa: BLE001
-                _LOGGER.debug(
-                    "Could not seed temp history from recorder", exc_info=True
-                )
 
         tracked = [self._source_temp, self._downstream]
         if self._source_humidity:
@@ -561,22 +440,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
         active = self._active_mode
         if active in (HVACMode.HEAT, HVACMode.COOL):
-            if self._sustain_active.get(active, False):
-                label = "heat" if active == HVACMode.HEAT else "cool"
-                target = (
-                    self._heat_target
-                    if active == HVACMode.HEAT
-                    else self._cool_target
-                )
-                tier_note = (
-                    f", fan tier {self._sustain_fan_idx}"
-                    if self._fan_tiers
-                    else ""
-                )
-                return (
-                    f"Sustain {label} → holding {target:.0f}°F{tier_note}",
-                    "mdi:radiator",
-                )
             if active == HVACMode.HEAT:
                 target = self._heat_target + self._overshoot[HVACMode.HEAT]
                 bits = [f"Heating → {target:.0f}°F"]
@@ -687,14 +550,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "recent_cool_starts": [
                 t.isoformat() for t in self._cycle_starts[HVACMode.COOL]
             ],
-            "sustain_heat_active": self._sustain_active[HVACMode.HEAT],
-            "sustain_cool_active": self._sustain_active[HVACMode.COOL],
-            "sustain_heat_preferred": self._sustain_preferred[HVACMode.HEAT],
-            "sustain_cool_preferred": self._sustain_preferred[HVACMode.COOL],
-            "sustain_fan_tier_idx": self._sustain_fan_idx,
-            "sawtooth_heat_detected": self._sawtooth_detected[HVACMode.HEAT],
-            "sawtooth_cool_detected": self._sawtooth_detected[HVACMode.COOL],
-            "temp_history_samples": len(self._temp_history),
         }
 
     # ------------------------------------------------------------------ user commands
@@ -736,7 +591,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         await self._async_control()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        prev_active = self._active_mode
         self._attr_hvac_mode = hvac_mode
         if hvac_mode == HVACMode.OFF:
             await self._async_stop_downstream()
@@ -748,13 +602,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         ):
             await self._async_stop_downstream()
             self._active_mode = None
-        # Any path that forcibly ended a cycle here needs to clear the
-        # previous mode's sustain session state — otherwise a stale
-        # fan_idx / sample list from a prior session could bleed into
-        # the next one.
-        if prev_active in (HVACMode.HEAT, HVACMode.COOL) and self._active_mode is None:
-            self._sustain_active[prev_active] = False
-            self._reset_sustain_session_state()
         self.async_write_ha_state()
         await self._async_control()
 
@@ -808,51 +655,35 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         room_temp = self.current_temperature
         self._last_room_temp = room_temp
 
-        # Treat the room sensor as lost if it has a value but hasn't
-        # updated in over an hour — the reading is too stale to trust.
-        room_sensor_stale = False
-        if room_temp is not None:
+        # Treat the room sensor as lost if it has no value, hasn't updated
+        # in over an hour (integration down), or has been reporting the
+        # exact same value for 12+ hours (sensor likely offline but the
+        # integration is still echoing the last reading — X-Sense does this).
+        sensor_issue: str | None = None
+        if room_temp is None:
+            sensor_issue = "unavailable"
+        else:
             room_state = self.hass.states.get(self._source_temp)
             if room_state is not None:
-                age = (
-                    dt_util.utcnow() - room_state.last_updated
-                ).total_seconds()
-                if self._room_sensor_stale_s > 0 and age > self._room_sensor_stale_s:
-                    room_sensor_stale = True
+                now_utc = dt_util.utcnow()
+                if self._room_sensor_stale_s > 0:
+                    age = (now_utc - room_state.last_updated).total_seconds()
+                    if age > self._room_sensor_stale_s:
+                        sensor_issue = (
+                            f"stale (no update for >{self._room_sensor_stale_s // 60}min)"
+                        )
+                if sensor_issue is None and self._room_sensor_stuck_s > 0:
+                    stuck_age = (now_utc - room_state.last_changed).total_seconds()
+                    if stuck_age > self._room_sensor_stuck_s:
+                        sensor_issue = (
+                            f"stuck (value unchanged for >{self._room_sensor_stuck_s // 3600}h)"
+                        )
 
-        if room_temp is None or room_sensor_stale:
+        if sensor_issue is not None:
             await self._async_handle_room_sensor_lost(
-                ds_state, allow_heat, allow_cool, stale=room_sensor_stale
+                ds_state, allow_heat, allow_cool, sensor_issue=sensor_issue
             )
             return
-
-        # Maintain rolling temperature history for sawtooth detection.
-        # Use the sensor's own last_changed timestamp so that rapid ticks
-        # don't create duplicate entries and timestamps are accurate.
-        if room_state is not None:
-            ts = room_state.last_changed
-            if not self._temp_history or self._temp_history[-1][0] != ts:
-                self._temp_history.append((ts, room_temp))
-                cutoff = dt_util.utcnow() - timedelta(seconds=SAWTOOTH_WINDOW_S)
-                while self._temp_history and self._temp_history[0][0] < cutoff:
-                    self._temp_history.pop(0)
-
-        # Sawtooth detection: check each allowed mode every tick. If the
-        # temperature history shows the alternating spike/return pattern,
-        # enter sustain now — before the normal bang-bang logic runs — so
-        # the very next cycle (or the current one) is already in sustain.
-        for _st_mode in (HVACMode.HEAT, HVACMode.COOL):
-            if _st_mode == HVACMode.HEAT and not allow_heat:
-                continue
-            if _st_mode == HVACMode.COOL and not allow_cool:
-                continue
-            detected = self._detect_sawtooth(_st_mode)
-            self._sawtooth_detected[_st_mode] = detected
-            if not self._sustain_active.get(_st_mode, False) and detected:
-                self._enter_sustain(
-                    _st_mode,
-                    reason="sawtooth oscillation detected in temperature history",
-                )
 
         self._emergency_active = False
 
@@ -909,12 +740,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     f"{settle_remaining}s of sensor-settle window "
                     f"({self._start_measurement_delay}s)"
                 )
-            if stopped and self._sustain_active.get(desired, False):
-                # Sustain holds the compressor on continuously. The
-                # stop-check is suppressed here — the dedicated sustain
-                # control loop (_async_drive_sustain) decides when to
-                # exit, not the bang-bang threshold.
-                stopped = False
             if stopped:
                 overshoot_note = (
                     f" (adaptive overshoot {overshoot:.1f}°F)"
@@ -951,22 +776,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         if desired != self._active_mode:
             if self._active_mode is None and desired is not None:
                 self._record_cycle_start_and_adapt(desired)
-                # Learned preference short-circuits detection: if this
-                # mode was in sustain last time we ran it, re-enter now
-                # and let drift-exit decide whether conditions still
-                # warrant it.
-                if self._sustain_preferred.get(desired, False):
-                    self._enter_sustain(desired, reason="restored preference")
-            prev_mode = self._active_mode
             self._active_mode = desired
             self._last_transition = dt_util.utcnow()
             if desired is None:
-                # Leaving an active cycle — clear sustain state for the
-                # previous mode. If the exit was driven by _async_drive_sustain
-                # it will have already set _sustain_active[prev] = False.
-                if prev_mode in (HVACMode.HEAT, HVACMode.COOL):
-                    self._sustain_active[prev_mode] = False
-                    self._reset_sustain_session_state()
                 await self._async_stop_downstream()
                 self._attr_hvac_action = HVACAction.IDLE
                 self._last_error = 0.0
@@ -1000,17 +812,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             self.async_write_ha_state()
             return
 
-        if self._sustain_active.get(self._active_mode, False):
-            reason = await self._async_drive_sustain(
-                room_temp, self._active_mode, ds_state
-            )
-            # Drive-sustain may have cleared _sustain_active as an exit
-            # signal; if so, the next tick will run the normal loop and
-            # shut down naturally once the stop threshold is met.
-        else:
-            reason = await self._async_drive_active(
-                room_temp, self._active_mode, ds_state
-            )
+        reason = await self._async_drive_active(
+            room_temp, self._active_mode, ds_state
+        )
         self._decision_reason = (
             f"{transition_reason}. {reason}" if transition_reason else reason
         )
@@ -1064,116 +868,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._setpoint_boost = 0.0
         self._progress_last_check = None
         self._progress_last_error = None
-        # Sustain detection is now handled by _detect_sawtooth(), which
-        # runs every tick against the rolling temperature history buffer.
-        # No per-cycle gap/duration tracking needed here.
-
-    # ------------------------------------------------------------------ sustain mode
-
-    def _detect_sawtooth(self, mode: HVACMode) -> bool:
-        """Return True if the temperature history shows a sawtooth pattern.
-
-        A sawtooth is identified by at least SAWTOOTH_MIN_ALTERNATIONS distinct
-        excursions into the "spike zone" (significantly past target in the
-        active direction) interleaved with returns into the "valley zone"
-        (back past the start threshold in the other direction).
-
-        The check is purely zone-based — no timing thresholds — so it fires
-        at the same sensitivity for fast (8-min) or slow (60-min) cycles.
-        """
-        now = dt_util.utcnow()
-        window_start = now - timedelta(seconds=SAWTOOTH_WINDOW_S)
-        # Don't look at data from before the last drift-exit. Without this,
-        # pre-sustain spikes still in the buffer would immediately re-trigger
-        # sustain after drift-exit, creating an exit → re-enter loop. Only
-        # fresh post-exit oscillations can justify re-entering.
-        exited_at = self._sustain_exited_at.get(mode)
-        if exited_at is not None and exited_at > window_start:
-            window_start = exited_at
-        samples = [(t, v) for t, v in self._temp_history if t >= window_start]
-        if len(samples) < 5:
-            return False
-
-        temps = [v for _, v in samples]
-
-        if mode == HVACMode.HEAT:
-            # spike zone: far above heat_target (sensor being blasted with warm air)
-            # return zone: below heat_target − deadband (room cooled back to start threshold)
-            def in_spike(v: float) -> bool:
-                return v >= self._heat_target + SAWTOOTH_SPIKE_FLOOR
-
-            def in_return(v: float) -> bool:
-                return v <= self._heat_target - self._deadband
-        else:
-            # Cool: mirror image — spike zone is far below cool_target
-            def in_spike(v: float) -> bool:
-                return v <= self._cool_target - SAWTOOTH_SPIKE_FLOOR
-
-            def in_return(v: float) -> bool:
-                return v >= self._cool_target + self._deadband
-
-        # Walk the series and count distinct zone-entry transitions.
-        # Middle-zone samples (between the two thresholds) don't reset
-        # the current zone, so a gradual crossing doesn't double-count.
-        spikes = 0
-        returns = 0
-        current_zone: str | None = None  # 'spike' | 'return' | None
-
-        for v in temps:
-            if in_spike(v):
-                if current_zone != "spike":
-                    spikes += 1
-                    current_zone = "spike"
-            elif in_return(v):
-                if current_zone != "return":
-                    returns += 1
-                    current_zone = "return"
-            # else: middle zone — keep current_zone unchanged
-
-        return (
-            spikes >= SAWTOOTH_MIN_ALTERNATIONS
-            and returns >= SAWTOOTH_MIN_ALTERNATIONS
-        )
-
-    def _enter_sustain(self, mode: HVACMode, *, reason: str) -> None:
-        """Flip a mode into sustain and reset per-session state."""
-        if self._sustain_active.get(mode, False):
-            return
-        self._sustain_active[mode] = True
-        self._sustain_preferred[mode] = True
-        self._reset_sustain_session_state()
-        _LOGGER.warning(
-            "Entering SUSTAIN for %s: %s", mode.value, reason
-        )
-
-    def _reset_sustain_session_state(self) -> None:
-        """Clear per-session sustain fields (called on enter and exit)."""
-        self._sustain_fan_idx = 0
-        self._sustain_last_fan_change = None
-        self._sustain_min_fan_since = None
-        self._sustain_samples = []
-
-    def _sustain_drift_rate(self) -> float | None:
-        """Return the room-temp slope in °F/min over the drift window,
-        or None if we don't have enough samples yet."""
-        if len(self._sustain_samples) < 2:
-            return None
-        now = dt_util.utcnow()
-        cutoff = now - timedelta(seconds=SUSTAIN_DRIFT_WINDOW_S)
-        window = [s for s in self._sustain_samples if s[0] >= cutoff]
-        if len(window) < 2:
-            return None
-        t0 = window[0][0]
-        xs = [(t - t0).total_seconds() / 60.0 for t, _ in window]
-        ys = [v for _, v in window]
-        n = len(xs)
-        mean_x = sum(xs) / n
-        mean_y = sum(ys) / n
-        num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-        den = sum((x - mean_x) ** 2 for x in xs)
-        if den == 0:
-            return None
-        return num / den
 
     # ------------------------------------------------------------------ room sensor lost
 
@@ -1182,15 +876,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         ds_state: State,
         allow_heat: bool,
         allow_cool: bool,
-        stale: bool = False,
+        sensor_issue: str = "unavailable",
     ) -> None:
-        """Emergency fallback when the room sensor is unavailable or stale."""
+        """Emergency fallback when the room sensor is unavailable, stale, or stuck."""
         was_emergency = self._emergency_active
-        sensor_issue = (
-            f"stale (no update for >{self._room_sensor_stale_s // 60}min)"
-            if stale
-            else "unavailable"
-        )
 
         if not self._emergency_enable:
             if not was_emergency and self._active_mode is not None:
@@ -1440,128 +1129,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             f"{setpoint:.0f}°F (target {offset_sign} {self._offset:.0f}°F offset, "
             f"clamped to {ds_min:.0f}–{ds_max:.0f}). "
             f"Fan tier: {fan_mode or 'n/a'}.{bias_note}{boost_note} {stop_label}."
-        )
-
-    async def _async_drive_sustain(
-        self, room_temp: float, mode: HVACMode, ds_state: State
-    ) -> str:
-        """Dedicated control loop for sustain mode.
-
-        Keeps the compressor engaged continuously with a gentle setpoint
-        (target +/- offset, no boost or bias push) and walks a fan tier
-        index up/down based on how the room is tracking the target.
-
-        The drift-based exit: once the fan has been parked at tier 0 for
-        SUSTAIN_MIN_FAN_HOLD_S and the room is drifting past target in
-        the "safe" direction at > SUSTAIN_DRIFT_EXIT_RATE °F/min, clear
-        the sustain flag so the next tick falls through to the normal
-        loop and shuts the unit off.
-        """
-        now = dt_util.utcnow()
-        ds_min, ds_max, ds_step = self._downstream_limits(ds_state)
-
-        # Gentle setpoint — just target +/- offset, no push.
-        if mode == HVACMode.HEAT:
-            target = self._heat_target
-            raw_setpoint = target + self._offset
-            error = target - room_temp  # +ve means we need more heat
-        else:
-            target = self._cool_target
-            raw_setpoint = target - self._offset
-            error = room_temp - target  # +ve means we need more cool
-        setpoint = self._clamp(raw_setpoint, ds_min, ds_max, ds_step)
-
-        available_fan = ds_state.attributes.get(ATTR_FAN_MODES) or []
-        usable_tiers = [
-            t for t in self._fan_tiers if t["fan_mode"] in available_fan
-        ]
-        max_idx = max(0, len(usable_tiers) - 1)
-        # Clamp in case usable_tiers shrank since the last tick (e.g., the
-        # downstream briefly lost its fan mode list).
-        self._sustain_fan_idx = min(self._sustain_fan_idx, max_idx)
-
-        # ---- Fan tier walker. Step by one, rate-limited.
-        can_step = (
-            self._sustain_last_fan_change is None
-            or (now - self._sustain_last_fan_change).total_seconds()
-            >= SUSTAIN_FAN_STEP_INTERVAL_S
-        )
-        if can_step and usable_tiers:
-            if error > SUSTAIN_FAN_DEADBAND and self._sustain_fan_idx < max_idx:
-                self._sustain_fan_idx += 1
-                self._sustain_last_fan_change = now
-                self._sustain_min_fan_since = None
-            elif error < -SUSTAIN_FAN_DEADBAND and self._sustain_fan_idx > 0:
-                self._sustain_fan_idx -= 1
-                self._sustain_last_fan_change = now
-
-        # Track when we first reached tier 0 (for drift-exit gate).
-        if self._sustain_fan_idx == 0 and self._sustain_min_fan_since is None:
-            self._sustain_min_fan_since = now
-        elif self._sustain_fan_idx > 0:
-            self._sustain_min_fan_since = None
-
-        fan_mode = (
-            usable_tiers[self._sustain_fan_idx]["fan_mode"]
-            if usable_tiers
-            else None
-        )
-
-        # ---- Sample drift and check for exit.
-        self._sustain_samples.append((now, room_temp))
-        cutoff = now - timedelta(seconds=SUSTAIN_DRIFT_WINDOW_S * 2)
-        self._sustain_samples = [
-            s for s in self._sustain_samples if s[0] >= cutoff
-        ]
-
-        drift_note = ""
-        exit_sustain = False
-        if (
-            self._sustain_min_fan_since is not None
-            and (now - self._sustain_min_fan_since).total_seconds()
-            >= SUSTAIN_MIN_FAN_HOLD_S
-        ):
-            slope = self._sustain_drift_rate()
-            if slope is not None:
-                if mode == HVACMode.HEAT:
-                    # Safe direction: room above target AND rising.
-                    safe = room_temp >= target and slope >= SUSTAIN_DRIFT_EXIT_RATE
-                else:
-                    # Safe direction: room below target AND falling.
-                    safe = room_temp <= target and -slope >= SUSTAIN_DRIFT_EXIT_RATE
-                drift_note = (
-                    f" Drift {slope:+.3f}°F/min; room {room_temp - target:+.1f}°F"
-                    f" vs target."
-                )
-                if safe:
-                    exit_sustain = True
-
-        await self._async_send(ds_state, mode, setpoint, fan_mode)
-
-        self._last_error = max(0.0, error)
-        self._last_pushed_setpoint = setpoint
-        self._last_fan_tier = fan_mode
-
-        if exit_sustain:
-            self._sustain_active[mode] = False
-            self._sustain_preferred[mode] = False
-            self._sustain_exited_at[mode] = now
-            _LOGGER.info(
-                "Exiting SUSTAIN for %s: ambient drift is doing the work "
-                "(fan at tier 0 for >= %ds, slope safe).",
-                mode.value,
-                SUSTAIN_MIN_FAN_HOLD_S,
-            )
-            return (
-                f"SUSTAIN {mode.value.upper()}: exit — ambient drift carrying "
-                f"the room past {target:.1f}°F on its own.{drift_note}"
-            )
-
-        return (
-            f"SUSTAIN {mode.value.upper()}: holding target {target:.1f}°F, "
-            f"room {room_temp:.1f}°F (error {error:+.1f}°F). "
-            f"Fan tier {self._sustain_fan_idx}/{max_idx} "
-            f"({fan_mode or 'n/a'}), setpoint {setpoint:.0f}°F.{drift_note}"
         )
 
     async def _async_send(

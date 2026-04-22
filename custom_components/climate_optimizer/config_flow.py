@@ -25,6 +25,7 @@ from .const import (
     CONF_MIN_CYCLE_TIME,
     CONF_OUTDOOR_TEMP_SENSOR,
     CONF_ROOM_SENSOR_STALE_MINUTES,
+    CONF_ROOM_SENSOR_STUCK_HOURS,
     CONF_SETPOINT_OFFSET,
     CONF_SOURCE_HUMIDITY_SENSOR,
     CONF_SOURCE_TEMP_SENSOR,
@@ -42,6 +43,7 @@ from .const import (
     DEFAULT_HEAT_TARGET,
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_ROOM_SENSOR_STALE_MINUTES,
+    DEFAULT_ROOM_SENSOR_STUCK_HOURS,
     DEFAULT_SETPOINT_OFFSET,
     DEFAULT_START_MEASUREMENT_DELAY,
     DEFAULT_TICK_INTERVAL,
@@ -160,6 +162,12 @@ def _emergency_fields(
             CONF_ROOM_SENSOR_STALE_MINUTES,
             default=current.get(
                 CONF_ROOM_SENSOR_STALE_MINUTES, DEFAULT_ROOM_SENSOR_STALE_MINUTES
+            ),
+        ): vol.Coerce(int),
+        vol.Required(
+            CONF_ROOM_SENSOR_STUCK_HOURS,
+            default=current.get(
+                CONF_ROOM_SENSOR_STUCK_HOURS, DEFAULT_ROOM_SENSOR_STUCK_HOURS
             ),
         ): vol.Coerce(int),
         vol.Required(

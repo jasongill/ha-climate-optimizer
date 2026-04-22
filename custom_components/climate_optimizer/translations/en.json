@@ -49,6 +49,7 @@
           "tick_interval": "Control loop interval (seconds)",
           "start_measurement_delay": "Sensor settle delay after cycle start (seconds)",
           "room_sensor_stale_minutes": "Treat room sensor as lost if no update for this many minutes (0 to disable)",
+          "room_sensor_stuck_hours": "Treat room sensor as offline if the value hasn't changed at all for this many hours (0 to disable)",
           "fan_tier_1_error": "Fan tier 1: max error from target band (\u00b0F)",
           "fan_tier_1_mode": "Fan tier 1: downstream fan mode",
           "fan_tier_2_error": "Fan tier 2: max error from target band (\u00b0F)",
