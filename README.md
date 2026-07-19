@@ -118,7 +118,9 @@ Emergency mode respects the virtual entity's current `hvac_mode` — if you've s
 
 ### Temporary fan limit
 
-Use **Configure → Temporary Fan Limit** to cap normal operation at a selected fan mode for a chosen number of hours. For example, select `low` and `4` hours while working beside the unit. The limit survives Home Assistant restarts and expires automatically; enter `0` hours to clear it early. Emergency fallback is intentionally allowed to exceed this cap.
+Each virtual device provides **Maximum Fan Speed** and **Fan Limit Duration** entities for dashboards and automations. Set the duration, then select a maximum speed such as `low`; selecting `Disabled` clears the cap. The default duration is four hours.
+
+The same controls remain available under **Configure → Temporary Fan Limit**. The limit survives Home Assistant restarts and expires automatically. Emergency fallback is intentionally allowed to exceed this cap.
 
 ## Control source
 

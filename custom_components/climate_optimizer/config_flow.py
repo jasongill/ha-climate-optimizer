@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from datetime import timedelta
 from typing import Any
 
@@ -48,6 +47,7 @@ from .const import (
     DEFAULT_EMERGENCY_HEAT_BELOW_OUTDOOR,
     DEFAULT_EMERGENCY_HEAT_SETPOINT,
     DEFAULT_HEAT_TARGET,
+    DEFAULT_FAN_LIMIT_HOURS,
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_ROOM_SENSOR_STALE_MINUTES,
     DEFAULT_ROOM_SENSOR_STUCK_HOURS,
@@ -414,21 +414,16 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
             merged = {**current}
             hours = float(user_input[CONF_FAN_LIMIT_HOURS])
             if hours > 0:
+                merged[CONF_FAN_LIMIT_HOURS] = hours
                 merged[CONF_FAN_LIMIT_MODE] = user_input[CONF_FAN_LIMIT_MODE]
                 merged[CONF_FAN_LIMIT_UNTIL] = (
                     dt_util.utcnow() + timedelta(hours=hours)
                 ).isoformat()
             else:
+                merged.pop(CONF_FAN_LIMIT_HOURS, None)
                 merged.pop(CONF_FAN_LIMIT_MODE, None)
                 merged.pop(CONF_FAN_LIMIT_UNTIL, None)
-            merged.pop(CONF_FAN_LIMIT_HOURS, None)
             return self.async_create_entry(title="", data=merged)
-
-        remaining_hours = 0
-        limit_until = dt_util.parse_datetime(current.get(CONF_FAN_LIMIT_UNTIL, ""))
-        if limit_until is not None:
-            remaining = (limit_until - dt_util.utcnow()).total_seconds()
-            remaining_hours = max(0, math.ceil(remaining / 3600))
 
         fan_options = _fan_mode_options(
             self.hass,
@@ -443,7 +438,7 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
                 ): _fan_mode_field(fan_options),
                 vol.Required(
                     CONF_FAN_LIMIT_HOURS,
-                    default=remaining_hours,
+                    default=current.get(CONF_FAN_LIMIT_HOURS, DEFAULT_FAN_LIMIT_HOURS),
                 ): _number(),
             }
         )

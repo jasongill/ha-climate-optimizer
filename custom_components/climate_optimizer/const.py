@@ -34,6 +34,8 @@ CONF_FAN_TIER_4_MODE = "fan_tier_4_mode"
 CONF_FAN_LIMIT_MODE = "fan_limit_mode"
 CONF_FAN_LIMIT_HOURS = "fan_limit_hours"
 CONF_FAN_LIMIT_UNTIL = "fan_limit_until"
+FAN_LIMIT_DISABLED = "Disabled"
+DEFAULT_FAN_LIMIT_HOURS = 4.0
 
 CONF_ROOM_SENSOR_STALE_MINUTES = "room_sensor_stale_minutes"
 CONF_ROOM_SENSOR_STUCK_HOURS = "room_sensor_stuck_hours"
