@@ -1,7 +1,10 @@
 """Virtual climate entity that drives a downstream climate device."""
+
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import re
 from datetime import datetime, timedelta
 from typing import Any
@@ -48,6 +51,8 @@ from .const import (
     CONF_EMERGENCY_FAN_MODE,
     CONF_EMERGENCY_HEAT_BELOW_OUTDOOR,
     CONF_EMERGENCY_HEAT_SETPOINT,
+    CONF_FAN_LIMIT_MODE,
+    CONF_FAN_LIMIT_UNTIL,
     CONF_HEAT_TARGET,
     CONF_MIN_CYCLE_TIME,
     CONF_OUTDOOR_TEMP_SENSOR,
@@ -195,6 +200,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     def __init__(self, entry: ConfigEntry, cfg: dict[str, Any]) -> None:
         self._entry_id = entry.entry_id
+        self._control_lock = asyncio.Lock()
 
         self._attr_name = cfg[CONF_NAME]
         self._attr_unique_id = f"{entry.entry_id}_virtual_climate"
@@ -227,7 +233,11 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             cfg.get(CONF_START_MEASUREMENT_DELAY, DEFAULT_START_MEASUREMENT_DELAY)
         )
         self._room_sensor_stale_s = (
-            int(cfg.get(CONF_ROOM_SENSOR_STALE_MINUTES, DEFAULT_ROOM_SENSOR_STALE_MINUTES))
+            int(
+                cfg.get(
+                    CONF_ROOM_SENSOR_STALE_MINUTES, DEFAULT_ROOM_SENSOR_STALE_MINUTES
+                )
+            )
             * 60
         )
         self._room_sensor_stuck_s = (
@@ -235,15 +245,23 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             * 3600
         )
         self._fan_tiers = _build_fan_tiers(cfg)
+        self._fan_limit_mode: str | None = cfg.get(CONF_FAN_LIMIT_MODE)
+        self._fan_limit_until = dt_util.parse_datetime(
+            cfg.get(CONF_FAN_LIMIT_UNTIL, "")
+        )
 
         self._emergency_enable = bool(
             cfg.get(CONF_EMERGENCY_ENABLE, DEFAULT_EMERGENCY_ENABLE)
         )
         self._emergency_heat_below = float(
-            cfg.get(CONF_EMERGENCY_HEAT_BELOW_OUTDOOR, DEFAULT_EMERGENCY_HEAT_BELOW_OUTDOOR)
+            cfg.get(
+                CONF_EMERGENCY_HEAT_BELOW_OUTDOOR, DEFAULT_EMERGENCY_HEAT_BELOW_OUTDOOR
+            )
         )
         self._emergency_cool_above = float(
-            cfg.get(CONF_EMERGENCY_COOL_ABOVE_OUTDOOR, DEFAULT_EMERGENCY_COOL_ABOVE_OUTDOOR)
+            cfg.get(
+                CONF_EMERGENCY_COOL_ABOVE_OUTDOOR, DEFAULT_EMERGENCY_COOL_ABOVE_OUTDOOR
+            )
         )
         self._emergency_heat_setpoint = float(
             cfg.get(CONF_EMERGENCY_HEAT_SETPOINT, DEFAULT_EMERGENCY_HEAT_SETPOINT)
@@ -318,9 +336,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                         self._heat_target = low_f
                         self._cool_target = high_f
             except (ValueError, TypeError):
-                _LOGGER.debug(
-                    "Could not restore target temps from %s/%s", low, high
-                )
+                _LOGGER.debug("Could not restore target temps from %s/%s", low, high)
             if last_state.state in (
                 HVACMode.OFF,
                 HVACMode.HEAT_COOL,
@@ -371,9 +387,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
         if self._area_id:
             dev_reg = dr.async_get(self.hass)
-            device = dev_reg.async_get_device(
-                identifiers={(DOMAIN, self._entry_id)}
-            )
+            device = dev_reg.async_get_device(identifiers={(DOMAIN, self._entry_id)})
             if device is not None and device.area_id != self._area_id:
                 dev_reg.async_update_device(device.id, area_id=self._area_id)
 
@@ -457,6 +471,8 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 extras.append(f"+{self._setpoint_boost:.0f}° push")
             if self._fan_boost:
                 extras.append(f"fan+{self._fan_boost}")
+            if self._fan_limit_active():
+                extras.append(f"fan ≤ {self._fan_limit_mode}")
             if self._ds_stale:
                 extras.append("ds sensor stale")
             if extras:
@@ -484,9 +500,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
         # Comfortably mid-band. Surface adaptive learning if any so the
         # user knows the system has been tuning itself.
-        learned = max(
-            self._overshoot[HVACMode.HEAT], self._overshoot[HVACMode.COOL]
-        )
+        learned = max(self._overshoot[HVACMode.HEAT], self._overshoot[HVACMode.COOL])
         if learned > 0:
             return (
                 f"Idle (learned +{learned:.1f}° overshoot)",
@@ -532,11 +546,18 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "adaptive_heat_overshoot": round(self._overshoot[HVACMode.HEAT], 2),
             "adaptive_cool_overshoot": round(self._overshoot[HVACMode.COOL], 2),
             "fan_boost": self._fan_boost,
+            "fan_limit_mode": (
+                self._fan_limit_mode if self._fan_limit_active() else None
+            ),
+            "fan_limit_until": (
+                self._fan_limit_until.isoformat()
+                if self._fan_limit_active() and self._fan_limit_until
+                else None
+            ),
+            "fan_limit_remaining_minutes": self._fan_limit_remaining_minutes(),
             "setpoint_boost": self._setpoint_boost,
             "downstream_sensor_bias": (
-                round(self._ds_bias_ema, 2)
-                if self._ds_bias_ema is not None
-                else None
+                round(self._ds_bias_ema, 2) if self._ds_bias_ema is not None else None
             ),
             "downstream_sensor_stale": self._ds_stale,
             "downstream_sensor_age_s": (
@@ -596,9 +617,8 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             await self._async_stop_downstream()
             self._active_mode = None
             self._attr_hvac_action = HVACAction.OFF
-        elif (
-            (self._active_mode == HVACMode.COOL and hvac_mode == HVACMode.HEAT)
-            or (self._active_mode == HVACMode.HEAT and hvac_mode == HVACMode.COOL)
+        elif (self._active_mode == HVACMode.COOL and hvac_mode == HVACMode.HEAT) or (
+            self._active_mode == HVACMode.HEAT and hvac_mode == HVACMode.COOL
         ):
             await self._async_stop_downstream()
             self._active_mode = None
@@ -606,6 +626,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         await self._async_control()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
+        ds_state = self.hass.states.get(self._downstream)
+        available = ds_state.attributes.get(ATTR_FAN_MODES) or [] if ds_state else []
+        fan_mode = self._cap_fan_mode(fan_mode, available)
         await self.hass.services.async_call(
             "climate",
             "set_fan_mode",
@@ -633,6 +656,12 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------ control core
 
     async def _async_control(self) -> None:
+        """Serialize control passes triggered by state changes and the timer."""
+        async with self._control_lock:
+            await self._async_control_locked()
+
+    async def _async_control_locked(self) -> None:
+        """Run one control pass while holding the control lock."""
         if self._attr_hvac_mode == HVACMode.OFF:
             self._decision_reason = "Virtual device is OFF"
             self.async_write_ha_state()
@@ -669,15 +698,11 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 if self._room_sensor_stale_s > 0:
                     age = (now_utc - room_state.last_updated).total_seconds()
                     if age > self._room_sensor_stale_s:
-                        sensor_issue = (
-                            f"stale (no update for >{self._room_sensor_stale_s // 60}min)"
-                        )
+                        sensor_issue = f"stale (no update for >{self._room_sensor_stale_s // 60}min)"
                 if sensor_issue is None and self._room_sensor_stuck_s > 0:
                     stuck_age = (now_utc - room_state.last_changed).total_seconds()
                     if stuck_age > self._room_sensor_stuck_s:
-                        sensor_issue = (
-                            f"stuck (value unchanged for >{self._room_sensor_stuck_s // 3600}h)"
-                        )
+                        sensor_issue = f"stuck (value unchanged for >{self._room_sensor_stuck_s // 3600}h)"
 
         if sensor_issue is not None:
             await self._async_handle_room_sensor_lost(
@@ -742,9 +767,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 )
             if stopped:
                 overshoot_note = (
-                    f" (adaptive overshoot {overshoot:.1f}°F)"
-                    if overshoot > 0
-                    else ""
+                    f" (adaptive overshoot {overshoot:.1f}°F)" if overshoot > 0 else ""
                 )
                 transition_reason = (
                     f"Ending {desired.value.upper()}: room {room_temp:.1f}°F "
@@ -754,24 +777,17 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
         # Minimum cycle time gate — only blocks turning ON (idle → active or
         # switching between active modes). Turning OFF is always allowed.
-        if (
-            desired is not None
-            and desired != self._active_mode
-            and self._last_transition is not None
-        ):
-            elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
-            if elapsed < self._min_cycle:
-                remaining = int(self._min_cycle - elapsed)
-                transition_reason = (
-                    f"Min cycle hold: wanted to start "
-                    f"{desired.value} but {remaining}s "
-                    f"remain of min_cycle_time ({self._min_cycle}s)"
-                )
-                desired = self._active_mode
-                # The idle-branch early return below would otherwise leave
-                # decision_reason stale; surface the hold reason now.
-                if desired is None:
-                    self._decision_reason = transition_reason
+        remaining = self._transition_hold_remaining(desired)
+        if remaining:
+            transition_reason = (
+                f"Min cycle hold: wanted to start {desired.value} but "
+                f"{remaining}s remain of min_cycle_time ({self._min_cycle}s)"
+            )
+            desired = self._active_mode
+            # The idle-branch early return below would otherwise leave
+            # decision_reason stale; surface the hold reason now.
+            if desired is None:
+                self._decision_reason = transition_reason
 
         if desired != self._active_mode:
             if self._active_mode is None and desired is not None:
@@ -812,9 +828,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             self.async_write_ha_state()
             return
 
-        reason = await self._async_drive_active(
-            room_temp, self._active_mode, ds_state
-        )
+        reason = await self._async_drive_active(room_temp, self._active_mode, ds_state)
         self._decision_reason = (
             f"{transition_reason}. {reason}" if transition_reason else reason
         )
@@ -855,9 +869,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 )
             elif gap > 2 * ADAPTIVE_TARGET_PERIOD_S:
                 # Comfortably long gap — relax overshoot back toward zero.
-                self._overshoot[mode] = max(
-                    0.0, self._overshoot[mode] - ADAPTIVE_DECAY
-                )
+                self._overshoot[mode] = max(0.0, self._overshoot[mode] - ADAPTIVE_DECAY)
         history.append(now)
         if len(history) > ADAPTIVE_HISTORY:
             del history[:-ADAPTIVE_HISTORY]
@@ -931,14 +943,19 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             return
 
         # Apply min-cycle gate to emergency transitions too — only on turn-on.
-        if (
-            desired is not None
-            and desired != self._active_mode
-            and self._last_transition is not None
-        ):
-            elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
-            if elapsed < self._min_cycle:
-                desired = self._active_mode or desired
+        remaining = self._transition_hold_remaining(desired)
+        if remaining:
+            if self._active_mode is None:
+                self._emergency_active = False
+                self._attr_hvac_action = HVACAction.IDLE
+                self._decision_reason = (
+                    f"Min cycle hold: emergency wants to start {desired.value}, "
+                    f"but {remaining}s remain of min_cycle_time "
+                    f"({self._min_cycle}s)."
+                )
+                self.async_write_ha_state()
+                return
+            desired = self._active_mode
 
         if desired != self._active_mode:
             self._active_mode = desired
@@ -1001,10 +1018,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         ds_current = _as_float_attr(ds_state.attributes.get("current_temperature"))
         ds_stale = False
         if ds_current is not None:
-            if (
-                self._ds_last_value is None
-                or ds_current != self._ds_last_value
-            ):
+            if self._ds_last_value is None or ds_current != self._ds_last_value:
                 # Fresh value — record and clear staleness.
                 self._ds_last_value = ds_current
                 self._ds_last_change_at = now
@@ -1017,9 +1031,8 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     if self._ds_last_change_at
                     else 0.0
                 )
-                room_delta = abs(
-                    room_temp - (self._ds_last_change_room_temp or room_temp)
-                )
+                baseline = self._ds_last_change_room_temp
+                room_delta = abs(room_temp - baseline) if baseline is not None else 0.0
                 if age > BIAS_STALE_AFTER_S and room_delta > BIAS_STALE_ROOM_DELTA:
                     ds_stale = True
 
@@ -1040,21 +1053,23 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         # we add the absolute hurt to the setpoint push, capped.
         bias_compensation = 0.0
         if self._ds_bias_ema is not None:
-            signed = (
-                self._ds_bias_ema if mode == HVACMode.HEAT else -self._ds_bias_ema
-            )
+            signed = self._ds_bias_ema if mode == HVACMode.HEAT else -self._ds_bias_ema
             bias_compensation = max(0.0, min(BIAS_MAX_COMPENSATION, signed))
 
         if mode == HVACMode.COOL:
             raw_setpoint = (
-                self._cool_target - self._offset
-                - bias_compensation - self._setpoint_boost
+                self._cool_target
+                - self._offset
+                - bias_compensation
+                - self._setpoint_boost
             )
             error = max(0.0, room_temp - self._cool_target)
         else:
             raw_setpoint = (
-                self._heat_target + self._offset
-                + bias_compensation + self._setpoint_boost
+                self._heat_target
+                + self._offset
+                + bias_compensation
+                + self._setpoint_boost
             )
             error = max(0.0, self._heat_target - room_temp)
 
@@ -1089,6 +1104,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 self._progress_last_error = error
 
         fan_mode = self._pick_fan_mode(error, available_fan, self._fan_boost)
+        fan_mode = self._cap_fan_mode(fan_mode, available_fan)
 
         self._last_error = error
         self._last_pushed_setpoint = setpoint
@@ -1122,13 +1138,19 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             if self._fan_boost:
                 parts.append(f"fan +{self._fan_boost}")
             boost_note = f" Stall boosts: {', '.join(parts)}."
+        limit_note = (
+            f" Temporary fan limit: ≤{self._fan_limit_mode}."
+            if self._fan_limit_active()
+            else ""
+        )
 
         return (
             f"{mode.value.upper()}ING: room {room_temp:.1f}°F, {target_label}, "
             f"error {error:.1f}°F. Pushing downstream setpoint to "
             f"{setpoint:.0f}°F (target {offset_sign} {self._offset:.0f}°F offset, "
             f"clamped to {ds_min:.0f}–{ds_max:.0f}). "
-            f"Fan tier: {fan_mode or 'n/a'}.{bias_note}{boost_note} {stop_label}."
+            f"Fan tier: {fan_mode or 'n/a'}.{bias_note}{boost_note}"
+            f"{limit_note} {stop_label}."
         )
 
     async def _async_send(
@@ -1145,26 +1167,19 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         cur_setpoint = ds_state.attributes.get(ATTR_TEMPERATURE)
         cur_fan = ds_state.attributes.get(ATTR_FAN_MODE)
 
-        # If the downstream's actual state disagrees with what we last sent,
-        # something external changed it (remote, cloud, timeout). Clear the
-        # dedup cache so we re-assert our desired state, and reset the stall
-        # progress clock so we don't immediately escalate boost on recovery.
-        if (
-            self._last_sent.get("hvac_mode") is not None
-            and cur_mode != self._last_sent["hvac_mode"]
-        ):
+        # A mismatch with no pending command means something external changed
+        # the unit after our previous write was confirmed.
+        if cur_mode != desired_hvac and "hvac_mode" not in self._last_sent:
             _LOGGER.warning(
-                "Downstream %s drifted to '%s' (expected '%s'); "
-                "re-asserting control",
+                "Downstream %s is '%s' (expected '%s'); " "re-asserting control",
                 self._downstream,
                 cur_mode,
-                self._last_sent["hvac_mode"],
+                desired_hvac,
             )
-            self._last_sent = {}
             self._progress_last_check = None
             self._progress_last_error = None
 
-        if cur_mode != desired_hvac and self._last_sent.get("hvac_mode") != desired_hvac:
+        if self._should_send("hvac_mode", cur_mode, desired_hvac):
             await self.hass.services.async_call(
                 "climate",
                 "set_hvac_mode",
@@ -1173,7 +1188,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             )
             self._last_sent["hvac_mode"] = desired_hvac
 
-        if cur_setpoint != setpoint and self._last_sent.get("setpoint") != setpoint:
+        if self._should_send("setpoint", cur_setpoint, setpoint):
             await self.hass.services.async_call(
                 "climate",
                 "set_temperature",
@@ -1186,7 +1201,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         if fan_mode and fan_mode not in available_fan:
             fan_mode = available_fan[0] if available_fan else None
 
-        if fan_mode and cur_fan != fan_mode and self._last_sent.get("fan_mode") != fan_mode:
+        if fan_mode and self._should_send("fan_mode", cur_fan, fan_mode):
             await self.hass.services.async_call(
                 "climate",
                 "set_fan_mode",
@@ -1218,6 +1233,61 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._last_sent = {"hvac_mode": "off"}
 
     # ------------------------------------------------------------------ helpers
+
+    def _transition_hold_remaining(self, desired: HVACMode | None) -> int:
+        """Return seconds remaining before a mode transition may start."""
+        if (
+            desired is None
+            or desired == self._active_mode
+            or self._last_transition is None
+        ):
+            return 0
+        elapsed = (dt_util.utcnow() - self._last_transition).total_seconds()
+        return max(0, math.ceil(self._min_cycle - elapsed))
+
+    def _should_send(self, key: str, current: Any, desired: Any) -> bool:
+        """Deduplicate pending writes while still correcting later drift."""
+        if current == desired:
+            # The downstream confirmed an earlier write. Removing the pending
+            # marker lets a subsequent manual/cloud change be re-asserted.
+            self._last_sent.pop(key, None)
+            return False
+        return self._last_sent.get(key) != desired
+
+    def _fan_limit_active(self) -> bool:
+        """Return whether the temporary fan cap is still active."""
+        return (
+            bool(self._fan_limit_mode)
+            and self._fan_limit_until is not None
+            and dt_util.utcnow() < self._fan_limit_until
+        )
+
+    def _fan_limit_remaining_minutes(self) -> int:
+        """Return whole minutes remaining on the temporary fan cap."""
+        if not self._fan_limit_active() or self._fan_limit_until is None:
+            return 0
+        seconds = (self._fan_limit_until - dt_util.utcnow()).total_seconds()
+        return max(0, math.ceil(seconds / 60))
+
+    def _cap_fan_mode(self, requested: str | None, available: list[str]) -> str | None:
+        """Apply the temporary cap to a normal-operation fan mode."""
+        if not requested or not self._fan_limit_active():
+            return requested
+        limit = self._fan_limit_mode
+        if limit not in available:
+            return requested
+
+        ranked = [
+            tier["fan_mode"]
+            for tier in self._fan_tiers
+            if tier["fan_mode"] in available
+        ]
+        ranked = list(dict.fromkeys(ranked))
+        if limit not in ranked:
+            return limit
+        if requested not in ranked:
+            return limit
+        return ranked[min(ranked.index(requested), ranked.index(limit))]
 
     def _pick_fan_mode(
         self, error: float, available: list[str], boost: int = 0
@@ -1265,4 +1335,4 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         value = max(low, min(high, value))
         if step > 0:
             value = round(value / step) * step
-        return value
+        return max(low, min(high, value))

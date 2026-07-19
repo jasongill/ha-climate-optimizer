@@ -37,7 +37,7 @@ The basic state machine is fine for well-behaved rooms, but real-world installs 
 When a heat or cool cycle starts within `30 min` of the previous start of the same mode, the integration treats this as short-cycling and lengthens the *stop* threshold for that mode by `0.5°F`, capped at `2°F`. So a leaky room that would otherwise stop heat at exactly `62°F` will end up running to `62.5°F`, then `63°F`, etc., until cycles stretch to a comfortable length. The overshoot decays asymmetrically (`0.25°F` per long cycle) so learning persists overnight and only fades when conditions clearly improve.
 
 ### Downstream sensor bias compensation (persists across restarts)
-The integration reads the minisplit's own `current_temperature` attribute and tracks the smoothed difference between *its* sensor and the *room* sensor. If the unit thinks it's `3°F` warmer than reality (very common when it's mounted high on the wall), the pushed setpoint is automatically lifted by `3°F` to restore the inverter's perceived gap. Compensation only applies in the direction that makes the unit work *harder* — never softer — and is capped at `5°F`.
+The integration reads the minisplit's own `current_temperature` attribute and tracks the smoothed difference between *its* sensor and the *room* sensor. If the unit thinks it's `3°F` warmer than reality (very common when it's mounted high on the wall), the pushed setpoint is automatically lifted by `3°F` to restore the inverter's perceived gap. Compensation only applies in the direction that makes the unit work *harder* — never softer — and is capped at `10°F`.
 
 Many minisplit platforms (aux, midea) refresh `current_temperature` only on a write, so the value can be hours stale. The integration detects this: if the downstream value hasn't changed for `10 min` *while* the room sensor has clearly moved, the bias EMA stops updating until the downstream finally refreshes. The previously-learned bias still drives compensation in the meantime — better than ignoring it.
 
@@ -115,6 +115,10 @@ For power users. Most installs won't need to touch these — the adaptive system
 | Emergency fan mode | Fan mode during emergency | `high` |
 
 Emergency mode respects the virtual entity's current `hvac_mode` — if you've set it to `heat_only`, it won't emergency-cool you.
+
+### Temporary fan limit
+
+Use **Configure → Temporary Fan Limit** to cap normal operation at a selected fan mode for a chosen number of hours. For example, select `low` and `4` hours while working beside the unit. The limit survives Home Assistant restarts and expires automatically; enter `0` hours to clear it early. Emergency fallback is intentionally allowed to exceed this cap.
 
 ## Control source
 

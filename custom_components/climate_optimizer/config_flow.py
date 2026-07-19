@@ -1,6 +1,9 @@
 """Config flow for Climate Optimizer."""
+
 from __future__ import annotations
 
+import math
+from datetime import timedelta
 from typing import Any
 
 import voluptuous as vol
@@ -9,6 +12,7 @@ from homeassistant.components.climate import ATTR_FAN_MODES
 from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_AREA_ID,
@@ -21,6 +25,9 @@ from .const import (
     CONF_EMERGENCY_FAN_MODE,
     CONF_EMERGENCY_HEAT_BELOW_OUTDOOR,
     CONF_EMERGENCY_HEAT_SETPOINT,
+    CONF_FAN_LIMIT_HOURS,
+    CONF_FAN_LIMIT_MODE,
+    CONF_FAN_LIMIT_UNTIL,
     CONF_HEAT_TARGET,
     CONF_MIN_CYCLE_TIME,
     CONF_OUTDOOR_TEMP_SENSOR,
@@ -50,6 +57,16 @@ from .const import (
     DOMAIN,
     FAN_TIER_KEYS,
 )
+
+
+def _number(minimum: float = 0) -> vol.All:
+    """Return a reusable non-negative numeric validator."""
+    return vol.All(vol.Coerce(float), vol.Range(min=minimum))
+
+
+def _integer(minimum: int = 0) -> vol.All:
+    """Return a reusable bounded integer validator."""
+    return vol.All(vol.Coerce(int), vol.Range(min=minimum))
 
 
 def _fan_mode_options(
@@ -94,12 +111,12 @@ def _fan_tier_fields(
 ) -> dict[Any, Any]:
     fields: dict[Any, Any] = {}
     for err_key, err_default, mode_key, mode_default in FAN_TIER_KEYS:
-        fields[
-            vol.Required(err_key, default=current.get(err_key, err_default))
-        ] = vol.Coerce(float)
-        fields[
-            vol.Required(mode_key, default=current.get(mode_key, mode_default))
-        ] = _fan_mode_field(fan_options)
+        fields[vol.Required(err_key, default=current.get(err_key, err_default))] = (
+            _number()
+        )
+        fields[vol.Required(mode_key, default=current.get(mode_key, mode_default))] = (
+            _fan_mode_field(fan_options)
+        )
     return fields
 
 
@@ -123,25 +140,25 @@ def _advanced_control_fields(values: dict[str, Any]) -> dict[Any, Any]:
         vol.Required(
             CONF_DEADBAND,
             default=values.get(CONF_DEADBAND, DEFAULT_DEADBAND),
-        ): vol.Coerce(float),
+        ): _number(),
         vol.Required(
             CONF_SETPOINT_OFFSET,
             default=values.get(CONF_SETPOINT_OFFSET, DEFAULT_SETPOINT_OFFSET),
-        ): vol.Coerce(float),
+        ): _number(),
         vol.Required(
             CONF_MIN_CYCLE_TIME,
             default=values.get(CONF_MIN_CYCLE_TIME, DEFAULT_MIN_CYCLE_TIME),
-        ): vol.Coerce(int),
+        ): _integer(),
         vol.Required(
             CONF_TICK_INTERVAL,
             default=values.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL),
-        ): vol.Coerce(int),
+        ): _integer(1),
         vol.Required(
             CONF_START_MEASUREMENT_DELAY,
             default=values.get(
                 CONF_START_MEASUREMENT_DELAY, DEFAULT_START_MEASUREMENT_DELAY
             ),
-        ): vol.Coerce(int),
+        ): _integer(),
     }
 
 
@@ -163,13 +180,13 @@ def _emergency_fields(
             default=current.get(
                 CONF_ROOM_SENSOR_STALE_MINUTES, DEFAULT_ROOM_SENSOR_STALE_MINUTES
             ),
-        ): vol.Coerce(int),
+        ): _integer(),
         vol.Required(
             CONF_ROOM_SENSOR_STUCK_HOURS,
             default=current.get(
                 CONF_ROOM_SENSOR_STUCK_HOURS, DEFAULT_ROOM_SENSOR_STUCK_HOURS
             ),
-        ): vol.Coerce(int),
+        ): _integer(),
         vol.Required(
             CONF_EMERGENCY_ENABLE,
             default=current.get(CONF_EMERGENCY_ENABLE, DEFAULT_EMERGENCY_ENABLE),
@@ -217,7 +234,21 @@ def _saved_fan_mode_values(data: dict[str, Any]) -> list[str]:
     """All fan-mode strings already stored in a config entry / form draft."""
     values = [data.get(mode_key) for _, _, mode_key, _ in FAN_TIER_KEYS]
     values.append(data.get(CONF_EMERGENCY_FAN_MODE))
+    values.append(data.get(CONF_FAN_LIMIT_MODE))
     return [v for v in values if isinstance(v, str)]
+
+
+def _merge_form_values(
+    current: dict[str, Any],
+    user_input: dict[str, Any],
+    optional_keys: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Merge a partial options page, removing optional values the user cleared."""
+    merged = {**current, **user_input}
+    for key in optional_keys:
+        if key not in user_input:
+            merged.pop(key, None)
+    return merged
 
 
 class ClimateOptimizerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -304,31 +335,10 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Main options page: targets, area, and a link to advanced."""
-        errors: dict[str, str] = {}
-        current = {**self.config_entry.data, **self.config_entry.options}
-
-        if user_input is not None:
-            target_error = _validate_targets(user_input)
-            if target_error:
-                errors["base"] = target_error
-            else:
-                # Merge with existing advanced values so they aren't lost.
-                merged = {**current, **user_input}
-                return self.async_create_entry(title="", data=merged)
-
-        schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_AREA_ID,
-                    description={"suggested_value": current.get(CONF_AREA_ID)},
-                ): selector.AreaSelector(),
-                **_target_fields(current),
-            }
-        )
+        """Show links to the targets and advanced options pages."""
         return self.async_show_menu(
             step_id="init",
-            menu_options=["targets", "advanced"],
+            menu_options=["targets", "fan_limit", "advanced"],
         )
 
     async def async_step_targets(
@@ -343,7 +353,9 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
             if target_error:
                 errors["base"] = target_error
             else:
-                merged = {**current, **user_input}
+                merged = _merge_form_values(
+                    current, user_input, optional_keys=(CONF_AREA_ID,)
+                )
                 return self.async_create_entry(title="", data=merged)
 
         schema = vol.Schema(
@@ -369,7 +381,9 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
         current = {**self.config_entry.data, **self.config_entry.options}
 
         if user_input is not None:
-            merged = {**current, **user_input}
+            merged = _merge_form_values(
+                current, user_input, optional_keys=(CONF_OUTDOOR_TEMP_SENSOR,)
+            )
             return self.async_create_entry(title="", data=merged)
 
         fan_options = _fan_mode_options(
@@ -388,4 +402,52 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
             step_id="advanced",
             data_schema=schema,
             errors=errors,
+        )
+
+    async def async_step_fan_limit(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Set or clear a temporary maximum fan mode."""
+        current = {**self.config_entry.data, **self.config_entry.options}
+
+        if user_input is not None:
+            merged = {**current}
+            hours = float(user_input[CONF_FAN_LIMIT_HOURS])
+            if hours > 0:
+                merged[CONF_FAN_LIMIT_MODE] = user_input[CONF_FAN_LIMIT_MODE]
+                merged[CONF_FAN_LIMIT_UNTIL] = (
+                    dt_util.utcnow() + timedelta(hours=hours)
+                ).isoformat()
+            else:
+                merged.pop(CONF_FAN_LIMIT_MODE, None)
+                merged.pop(CONF_FAN_LIMIT_UNTIL, None)
+            merged.pop(CONF_FAN_LIMIT_HOURS, None)
+            return self.async_create_entry(title="", data=merged)
+
+        remaining_hours = 0
+        limit_until = dt_util.parse_datetime(current.get(CONF_FAN_LIMIT_UNTIL, ""))
+        if limit_until is not None:
+            remaining = (limit_until - dt_util.utcnow()).total_seconds()
+            remaining_hours = max(0, math.ceil(remaining / 3600))
+
+        fan_options = _fan_mode_options(
+            self.hass,
+            current.get(CONF_DOWNSTREAM_CLIMATE),
+            _saved_fan_mode_values(current),
+        )
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_FAN_LIMIT_MODE,
+                    default=current.get(CONF_FAN_LIMIT_MODE, "low"),
+                ): _fan_mode_field(fan_options),
+                vol.Required(
+                    CONF_FAN_LIMIT_HOURS,
+                    default=remaining_hours,
+                ): _number(),
+            }
+        )
+        return self.async_show_form(
+            step_id="fan_limit",
+            data_schema=schema,
         )

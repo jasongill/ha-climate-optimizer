@@ -1,4 +1,5 @@
 """Constants for the Climate Optimizer integration."""
+
 from __future__ import annotations
 
 DOMAIN = "climate_optimizer"
@@ -30,6 +31,9 @@ CONF_FAN_TIER_3_ERROR = "fan_tier_3_error"
 CONF_FAN_TIER_3_MODE = "fan_tier_3_mode"
 CONF_FAN_TIER_4_ERROR = "fan_tier_4_error"
 CONF_FAN_TIER_4_MODE = "fan_tier_4_mode"
+CONF_FAN_LIMIT_MODE = "fan_limit_mode"
+CONF_FAN_LIMIT_HOURS = "fan_limit_hours"
+CONF_FAN_LIMIT_UNTIL = "fan_limit_until"
 
 CONF_ROOM_SENSOR_STALE_MINUTES = "room_sensor_stale_minutes"
 CONF_ROOM_SENSOR_STUCK_HOURS = "room_sensor_stuck_hours"
@@ -70,8 +74,28 @@ DEFAULT_EMERGENCY_FAN_MODE = "high"
 
 # Ordered list used to iterate over all fan tier fields at once.
 FAN_TIER_KEYS: list[tuple[str, float, str, str]] = [
-    (CONF_FAN_TIER_1_ERROR, DEFAULT_FAN_TIER_1_ERROR, CONF_FAN_TIER_1_MODE, DEFAULT_FAN_TIER_1_MODE),
-    (CONF_FAN_TIER_2_ERROR, DEFAULT_FAN_TIER_2_ERROR, CONF_FAN_TIER_2_MODE, DEFAULT_FAN_TIER_2_MODE),
-    (CONF_FAN_TIER_3_ERROR, DEFAULT_FAN_TIER_3_ERROR, CONF_FAN_TIER_3_MODE, DEFAULT_FAN_TIER_3_MODE),
-    (CONF_FAN_TIER_4_ERROR, DEFAULT_FAN_TIER_4_ERROR, CONF_FAN_TIER_4_MODE, DEFAULT_FAN_TIER_4_MODE),
+    (
+        CONF_FAN_TIER_1_ERROR,
+        DEFAULT_FAN_TIER_1_ERROR,
+        CONF_FAN_TIER_1_MODE,
+        DEFAULT_FAN_TIER_1_MODE,
+    ),
+    (
+        CONF_FAN_TIER_2_ERROR,
+        DEFAULT_FAN_TIER_2_ERROR,
+        CONF_FAN_TIER_2_MODE,
+        DEFAULT_FAN_TIER_2_MODE,
+    ),
+    (
+        CONF_FAN_TIER_3_ERROR,
+        DEFAULT_FAN_TIER_3_ERROR,
+        CONF_FAN_TIER_3_MODE,
+        DEFAULT_FAN_TIER_3_MODE,
+    ),
+    (
+        CONF_FAN_TIER_4_ERROR,
+        DEFAULT_FAN_TIER_4_ERROR,
+        CONF_FAN_TIER_4_MODE,
+        DEFAULT_FAN_TIER_4_MODE,
+    ),
 ]
