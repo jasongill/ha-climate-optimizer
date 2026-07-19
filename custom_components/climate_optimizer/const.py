@@ -34,8 +34,19 @@ CONF_FAN_TIER_4_MODE = "fan_tier_4_mode"
 CONF_FAN_LIMIT_MODE = "fan_limit_mode"
 CONF_FAN_LIMIT_HOURS = "fan_limit_hours"
 CONF_FAN_LIMIT_UNTIL = "fan_limit_until"
+CONF_FAN_LIMIT_MAX_HOURS = "fan_limit_max_hours"
 FAN_LIMIT_DISABLED = "Disabled"
 DEFAULT_FAN_LIMIT_HOURS = 4.0
+DEFAULT_FAN_LIMIT_MAX_HOURS = 24.0
+
+FAN_LIMIT_OPTION_KEYS = frozenset(
+    {
+        CONF_FAN_LIMIT_MODE,
+        CONF_FAN_LIMIT_HOURS,
+        CONF_FAN_LIMIT_UNTIL,
+        CONF_FAN_LIMIT_MAX_HOURS,
+    }
+)
 
 CONF_ROOM_SENSOR_STALE_MINUTES = "room_sensor_stale_minutes"
 CONF_ROOM_SENSOR_STUCK_HOURS = "room_sensor_stuck_hours"

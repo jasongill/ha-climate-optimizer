@@ -45,7 +45,8 @@
         "description": "Temporarily cap the fan during normal operation. Set duration to 0 to remove the limit. Emergency fallback is not capped.",
         "data": {
           "fan_limit_mode": "Maximum fan mode",
-          "fan_limit_hours": "Duration from now (hours)"
+          "fan_limit_hours": "Duration from now (hours)",
+          "fan_limit_max_hours": "Maximum duration allowed on the dashboard (hours)"
         }
       },
       "advanced": {

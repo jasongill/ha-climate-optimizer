@@ -120,7 +120,7 @@ Emergency mode respects the virtual entity's current `hvac_mode` — if you've s
 
 Each virtual device provides **Maximum Fan Speed** and **Fan Limit Duration** entities for dashboards and automations. Set the duration, then select a maximum speed such as `low`; selecting `Disabled` clears the cap. The default duration is four hours.
 
-The same controls remain available under **Configure → Temporary Fan Limit**. The limit survives Home Assistant restarts and expires automatically. Emergency fallback is intentionally allowed to exceed this cap.
+The same controls remain available under **Configure → Temporary Fan Limit**, along with the maximum duration exposed by the dashboard number entity (24 hours by default). Dashboard changes apply live without restarting the climate control loop. The limit survives Home Assistant restarts and expires automatically. Emergency fallback is intentionally allowed to exceed this cap.
 
 ## Control source
 

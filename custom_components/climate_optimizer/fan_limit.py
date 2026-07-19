@@ -17,6 +17,13 @@ from .const import (
     DOMAIN,
 )
 
+FAN_LIMIT_SIGNAL = f"{DOMAIN}_fan_limit_updated"
+
+
+def fan_limit_signal(entry_id: str) -> str:
+    """Return the per-entry live-update signal."""
+    return f"{FAN_LIMIT_SIGNAL}_{entry_id}"
+
 
 def device_info(entry: ConfigEntry) -> DeviceInfo:
     """Return the shared virtual-device identity."""

@@ -32,6 +32,7 @@ from homeassistant.const import (
 from homeassistant.core import Event, HomeAssistant, State, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_track_state_change_event,
@@ -81,6 +82,7 @@ from .const import (
     DOMAIN,
     FAN_TIER_KEYS,
 )
+from .fan_limit import fan_limit_signal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -199,6 +201,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
     _attr_should_poll = False
 
     def __init__(self, entry: ConfigEntry, cfg: dict[str, Any]) -> None:
+        self._entry = entry
         self._entry_id = entry.entry_id
         self._control_lock = asyncio.Lock()
 
@@ -245,10 +248,6 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             * 3600
         )
         self._fan_tiers = _build_fan_tiers(cfg)
-        self._fan_limit_mode: str | None = cfg.get(CONF_FAN_LIMIT_MODE)
-        self._fan_limit_until = dt_util.parse_datetime(
-            cfg.get(CONF_FAN_LIMIT_UNTIL, "")
-        )
 
         self._emergency_enable = bool(
             cfg.get(CONF_EMERGENCY_ENABLE, DEFAULT_EMERGENCY_ENABLE)
@@ -384,6 +383,13 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 timedelta(seconds=self._tick_interval),
             )
         )
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                fan_limit_signal(self._entry_id),
+                self._async_fan_limit_updated,
+            )
+        )
 
         if self._area_id:
             dev_reg = dr.async_get(self.hass)
@@ -472,7 +478,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             if self._fan_boost:
                 extras.append(f"fan+{self._fan_boost}")
             if self._fan_limit_active():
-                extras.append(f"fan ≤ {self._fan_limit_mode}")
+                extras.append(f"fan ≤ {self._fan_limit_mode_value()}")
             if self._ds_stale:
                 extras.append("ds sensor stale")
             if extras:
@@ -547,11 +553,11 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "adaptive_cool_overshoot": round(self._overshoot[HVACMode.COOL], 2),
             "fan_boost": self._fan_boost,
             "fan_limit_mode": (
-                self._fan_limit_mode if self._fan_limit_active() else None
+                self._fan_limit_mode_value() if self._fan_limit_active() else None
             ),
             "fan_limit_until": (
-                self._fan_limit_until.isoformat()
-                if self._fan_limit_active() and self._fan_limit_until
+                self._fan_limit_until_value().isoformat()
+                if self._fan_limit_active() and self._fan_limit_until_value()
                 else None
             ),
             "fan_limit_remaining_minutes": self._fan_limit_remaining_minutes(),
@@ -648,6 +654,11 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     @callback
     def _async_state_changed(self, event: Event) -> None:
+        self.hass.async_create_task(self._async_control())
+
+    @callback
+    def _async_fan_limit_updated(self) -> None:
+        """Apply a dashboard fan-limit change without reloading the entity."""
         self.hass.async_create_task(self._async_control())
 
     async def _async_tick(self, _now: datetime) -> None:
@@ -1139,7 +1150,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 parts.append(f"fan +{self._fan_boost}")
             boost_note = f" Stall boosts: {', '.join(parts)}."
         limit_note = (
-            f" Temporary fan limit: ≤{self._fan_limit_mode}."
+            f" Temporary fan limit: ≤{self._fan_limit_mode_value()}."
             if self._fan_limit_active()
             else ""
         )
@@ -1256,24 +1267,32 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     def _fan_limit_active(self) -> bool:
         """Return whether the temporary fan cap is still active."""
-        return (
-            bool(self._fan_limit_mode)
-            and self._fan_limit_until is not None
-            and dt_util.utcnow() < self._fan_limit_until
-        )
+        mode = self._fan_limit_mode_value()
+        until = self._fan_limit_until_value()
+        return bool(mode) and until is not None and dt_util.utcnow() < until
 
     def _fan_limit_remaining_minutes(self) -> int:
         """Return whole minutes remaining on the temporary fan cap."""
-        if not self._fan_limit_active() or self._fan_limit_until is None:
+        until = self._fan_limit_until_value()
+        if not self._fan_limit_active() or until is None:
             return 0
-        seconds = (self._fan_limit_until - dt_util.utcnow()).total_seconds()
+        seconds = (until - dt_util.utcnow()).total_seconds()
         return max(0, math.ceil(seconds / 60))
+
+    def _fan_limit_mode_value(self) -> str | None:
+        """Return the current live fan-limit mode from config-entry options."""
+        value = self._entry.options.get(CONF_FAN_LIMIT_MODE)
+        return str(value) if value else None
+
+    def _fan_limit_until_value(self) -> datetime | None:
+        """Return the current live fan-limit expiration."""
+        return dt_util.parse_datetime(self._entry.options.get(CONF_FAN_LIMIT_UNTIL, ""))
 
     def _cap_fan_mode(self, requested: str | None, available: list[str]) -> str | None:
         """Apply the temporary cap to a normal-operation fan mode."""
         if not requested or not self._fan_limit_active():
             return requested
-        limit = self._fan_limit_mode
+        limit = self._fan_limit_mode_value()
         if limit not in available:
             return requested
 

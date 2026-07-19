@@ -25,6 +25,7 @@ from .const import (
     CONF_EMERGENCY_HEAT_BELOW_OUTDOOR,
     CONF_EMERGENCY_HEAT_SETPOINT,
     CONF_FAN_LIMIT_HOURS,
+    CONF_FAN_LIMIT_MAX_HOURS,
     CONF_FAN_LIMIT_MODE,
     CONF_FAN_LIMIT_UNTIL,
     CONF_HEAT_TARGET,
@@ -46,8 +47,9 @@ from .const import (
     DEFAULT_EMERGENCY_FAN_MODE,
     DEFAULT_EMERGENCY_HEAT_BELOW_OUTDOOR,
     DEFAULT_EMERGENCY_HEAT_SETPOINT,
-    DEFAULT_HEAT_TARGET,
     DEFAULT_FAN_LIMIT_HOURS,
+    DEFAULT_FAN_LIMIT_MAX_HOURS,
+    DEFAULT_HEAT_TARGET,
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_ROOM_SENSOR_STALE_MINUTES,
     DEFAULT_ROOM_SENSOR_STUCK_HOURS,
@@ -412,7 +414,9 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
 
         if user_input is not None:
             merged = {**current}
-            hours = float(user_input[CONF_FAN_LIMIT_HOURS])
+            max_hours = float(user_input[CONF_FAN_LIMIT_MAX_HOURS])
+            hours = min(float(user_input[CONF_FAN_LIMIT_HOURS]), max_hours)
+            merged[CONF_FAN_LIMIT_MAX_HOURS] = max_hours
             if hours > 0:
                 merged[CONF_FAN_LIMIT_HOURS] = hours
                 merged[CONF_FAN_LIMIT_MODE] = user_input[CONF_FAN_LIMIT_MODE]
@@ -440,6 +444,12 @@ class ClimateOptimizerOptionsFlow(config_entries.OptionsFlow):
                     CONF_FAN_LIMIT_HOURS,
                     default=current.get(CONF_FAN_LIMIT_HOURS, DEFAULT_FAN_LIMIT_HOURS),
                 ): _number(),
+                vol.Required(
+                    CONF_FAN_LIMIT_MAX_HOURS,
+                    default=current.get(
+                        CONF_FAN_LIMIT_MAX_HOURS, DEFAULT_FAN_LIMIT_MAX_HOURS
+                    ),
+                ): _number(0.5),
             }
         )
         return self.async_show_form(

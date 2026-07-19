@@ -1,4 +1,5 @@
 """Climate Optimizer integration."""
+
 from __future__ import annotations
 
 import logging
@@ -6,8 +7,10 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import CONFIG_VERSION, FAN_TIER_KEYS
+from .const import CONFIG_VERSION, DOMAIN, FAN_LIMIT_OPTION_KEYS, FAN_TIER_KEYS
+from .fan_limit import fan_limit_signal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +24,9 @@ PLATFORMS: list[Platform] = [
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a Climate Optimizer config entry."""
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "loaded_options": dict(entry.options)
+    }
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
@@ -28,7 +34,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    return unloaded
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -47,12 +56,8 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             FAN_TIER_KEYS
         ):
             if i < len(legacy):
-                data.setdefault(
-                    err_key, float(legacy[i].get("max_error", err_default))
-                )
-                data.setdefault(
-                    mode_key, str(legacy[i].get("fan_mode", mode_default))
-                )
+                data.setdefault(err_key, float(legacy[i].get("max_error", err_default)))
+                data.setdefault(mode_key, str(legacy[i].get("fan_mode", mode_default)))
             else:
                 data.setdefault(err_key, err_default)
                 data.setdefault(mode_key, mode_default)
@@ -64,4 +69,17 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload the entry when options are updated."""
+    entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
+    previous = entry_data.get("loaded_options", {})
+    changed = {
+        key
+        for key in previous.keys() | entry.options.keys()
+        if previous.get(key) != entry.options.get(key)
+    }
+    entry_data["loaded_options"] = dict(entry.options)
+    if changed and changed <= FAN_LIMIT_OPTION_KEYS:
+        async_dispatcher_send(hass, fan_limit_signal(entry.entry_id))
+        return
+    if not changed:
+        return
     await hass.config_entries.async_reload(entry.entry_id)
