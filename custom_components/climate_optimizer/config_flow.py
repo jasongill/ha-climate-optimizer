@@ -33,6 +33,7 @@ from .const import (
     CONF_OUTDOOR_TEMP_SENSOR,
     CONF_ROOM_SENSOR_STALE_MINUTES,
     CONF_ROOM_SENSOR_STUCK_HOURS,
+    CONF_SETTLING_TIME,
     CONF_SETPOINT_OFFSET,
     CONF_SOURCE_HUMIDITY_SENSOR,
     CONF_SOURCE_TEMP_SENSOR,
@@ -53,6 +54,7 @@ from .const import (
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_ROOM_SENSOR_STALE_MINUTES,
     DEFAULT_ROOM_SENSOR_STUCK_HOURS,
+    DEFAULT_SETTLING_TIME,
     DEFAULT_SETPOINT_OFFSET,
     DEFAULT_START_MEASUREMENT_DELAY,
     DEFAULT_TICK_INTERVAL,
@@ -150,6 +152,10 @@ def _advanced_control_fields(values: dict[str, Any]) -> dict[Any, Any]:
         vol.Required(
             CONF_MIN_CYCLE_TIME,
             default=values.get(CONF_MIN_CYCLE_TIME, DEFAULT_MIN_CYCLE_TIME),
+        ): _integer(),
+        vol.Required(
+            CONF_SETTLING_TIME,
+            default=values.get(CONF_SETTLING_TIME, DEFAULT_SETTLING_TIME),
         ): _integer(),
         vol.Required(
             CONF_TICK_INTERVAL,

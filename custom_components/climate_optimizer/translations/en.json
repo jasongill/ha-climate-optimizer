@@ -51,11 +51,12 @@
       },
       "advanced": {
         "title": "Advanced Settings",
-        "description": "Timing, fan tiers, and emergency fallback. Most users won't need to change these \u2014 the adaptive control system handles tuning automatically.",
+        "description": "Timing, fan tiers, trajectory control, and emergency fallback. Most users should begin with the conservative defaults.",
         "data": {
           "deadband": "Hysteresis / deadband (\u00b0F)",
           "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
           "min_cycle_time": "Minimum off time before restart (seconds)",
+          "settling_time": "Room settling time after shutdown (seconds)",
           "tick_interval": "Control loop interval (seconds)",
           "start_measurement_delay": "Sensor settle delay after cycle start (seconds)",
           "room_sensor_stale_minutes": "Treat room sensor as lost if no update for this many minutes (0 to disable)",
@@ -69,7 +70,7 @@
           "fan_tier_4_error": "Fan tier 4: max error (use a large number for 'everything else')",
           "fan_tier_4_mode": "Fan tier 4: downstream fan mode",
           "emergency_enable": "Enable emergency fallback when the room sensor is unavailable",
-          "outdoor_temp_sensor": "Outdoor temperature sensor (optional, for emergency fallback)",
+          "outdoor_temp_sensor": "Outdoor temperature sensor (optional, for seasonal learning and emergency fallback)",
           "emergency_heat_below_outdoor": "Emergency: force heat when outdoor is below (\u00b0F)",
           "emergency_cool_above_outdoor": "Emergency: force cool when outdoor is above (\u00b0F)",
           "emergency_heat_setpoint": "Emergency heat setpoint sent to mini split (\u00b0F)",

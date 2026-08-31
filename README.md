@@ -20,66 +20,52 @@ The virtual entity exposes a `decision_reason` attribute so you can see, at a gl
 
 ## How the control loop works
 
-The state machine is intentionally simple and uses asymmetric hysteresis to avoid short cycling:
+The state machine uses hysteresis, temperature trajectory, and an explicit post-cycle settling period:
 
 - **Start cooling** when the room climbs to `cool_target + deadband`. Command the downstream unit to `cool` with a setpoint pushed `setpoint_offset` degrees **below** the cool target, so the unit actually runs instead of thinking it is already at temperature.
 - **Start heating** when the room drops to `heat_target - deadband`. Mirror image: command `heat` with a setpoint pushed `setpoint_offset` degrees **above** the heat target.
-- **Stop** (turn the downstream unit fully off) when the room reaches the target (plus any adaptive overshoot — see below), then wait `min_cycle_time` before another transition is allowed.
+- **Ease off near target** by shrinking the downstream setpoint offset toward 2°F. This lets an inverter run longer at lower output instead of repeatedly demanding maximum capacity.
+- **Stop predictively** when the filtered room temperature or its learned five-minute projection reaches the target, then observe a configurable settling period before another cycle.
 - On every tick, the commanded fan mode is re-evaluated based on the current error from the target band and the configured fan tiers.
 
 Downstream commands are de-duplicated — the integration only resends mode/setpoint/fan changes when they actually differ from the downstream entity's current state.
 
-## Adaptive control
+## Low-sawtooth control
 
-The basic state machine is fine for well-behaved rooms, but real-world installs are messy: leaky rooms short-cycle, the minisplit's own sensor lies, and inverters under-modulate when their perceived setpoint delta is small. Four learning mechanisms run on top of the base loop to handle this automatically — no user tuning required.
+Remote room sensors react more slowly than air at a wall-mounted mini split. The integration keeps a de-duplicated 20-minute sample buffer, filters the three most recent readings with a median, and fits a temperature slope over the last 10 minutes. A five-minute projection allows cooling or heating to stop before sensor lag carries the room through the target.
 
-### Adaptive overshoot (per zone, persists across restarts)
-When a heat or cool cycle starts within `30 min` of the previous start of the same mode, the integration treats this as short-cycling and lengthens the *stop* threshold for that mode by `0.5°F`, capped at `2°F`. So a leaky room that would otherwise stop heat at exactly `62°F` will end up running to `62.5°F`, then `63°F`, etc., until cycles stretch to a comfortable length. The overshoot decays asymmetrically (`0.25°F` per long cycle) so learning persists overnight and only fades when conditions clearly improve.
+The configured downstream offset is a maximum. Within 1°F of target, the controller uses at most a 2°F offset; from 1–3°F error it interpolates smoothly toward the configured maximum. Fan mode continues to follow the configured tiers, but the controller never automatically boosts past the natural tier.
 
-### Downstream sensor bias compensation (persists across restarts)
-The integration reads the minisplit's own `current_temperature` attribute and tracks the smoothed difference between *its* sensor and the *room* sensor. If the unit thinks it's `3°F` warmer than reality (very common when it's mounted high on the wall), the pushed setpoint is automatically lifted by `3°F` to restore the inverter's perceived gap. Compensation only applies in the direction that makes the unit work *harder* — never softer — and is capped at `10°F`.
+The mini split's own temperature bias is retained as a diagnostic attribute but does not increase demand. This avoids extreme commands when a wall-unit sensor is stale or reads in the cold/warm discharge plume.
 
-Many minisplit platforms (aux, midea) refresh `current_temperature` only on a write, so the value can be hours stale. The integration detects this: if the downstream value hasn't changed for `10 min` *while* the room sensor has clearly moved, the bias EMA stops updating until the downstream finally refreshes. The previously-learned bias still drives compensation in the meantime — better than ignoring it.
+### Continuous learning
 
-### Setpoint boost (within-cycle, free)
-Every `5 min` while a cycle is running, progress is sampled. If the room error has shrunk by less than `0.5°F` over the interval (or has gotten worse), the pushed setpoint is bumped another `1°F` further from target, up to `4°F` extra. Inverters scale compressor speed with the perceived delta, so this directly increases BTU/min at no comfort cost.
+Each virtual device continuously learns bounded temperature-change rates separately for heating and cooling, for every fan mode it actually uses. When an outdoor sensor is configured, it also keeps coarse 10°F outdoor-temperature buckets so a mild spring day does not overwrite peak-summer behavior. The learner blends those estimates with the live room trend and learns the remaining temperature drift after shutdown.
 
-### Fan boost (within-cycle, last resort)
-Once setpoint boost is exhausted and progress is *still* stalled, the chosen fan tier is shifted up one slot per stall window. This is the only adaptive lever that costs noise, so it's intentionally last in the escalation order.
-
-Both within-cycle boosts reset on every new cycle.
-
-### Sustain mode (rapid-cycling escape hatch)
-Some rooms short-cycle no matter how the bang-bang loop is tuned — a sensor too close to the vent spikes on airflow, or the envelope leaks faster than a normal cycle can keep up. Sustain mode detects this purely from the user's own `min_cycle_time` setting: if the last two gaps between cycle starts of the same mode are each within `2×` of `min_cycle_time`, the unit is cycling too fast by the user's own definition and sustain activates for that mode.
-
-In sustain, the compressor stays engaged continuously and **fan tier becomes the proportional control variable**. A slow walker steps the fan tier up when the room drops below target and down when it rises above, no faster than once every `2 min` to avoid audible jitter. The setpoint is held at `target ± offset` with no boost or bias push — inverters naturally modulate their output based on the perceived delta, so lower fan really does mean less heat delivered.
-
-**Exit is drift-based**, no probing. Once the fan has been parked at its minimum tier for `10 min`, the integration fits a slope over the last `10 min` of room temperatures. If the room is on the safe side of target *and* drifting further that way (heat: above target and rising; cool: below target and falling) at ≥ `0.02°F/min`, ambient conditions are doing the work — sustain exits and the normal loop takes over.
-
-The sustain-preferred state is remembered per mode and persists across restarts, so a room that's been in sustain will re-enter immediately on the next cycle rather than waiting to re-detect the rapid pattern. The preference is cleared on a drift-exit, so memory is self-correcting across seasons.
+Learning persists in the entity's restored state across Home Assistant restarts. Confidence rises gradually over repeated observations. A large temperature discontinuity while the equipment is idle is treated as a likely sensor move: confidence is reduced and adaptation temporarily speeds up. Learned values affect predictive stopping only—they cannot select a higher fan tier, exceed a temporary fan limit, or push a more aggressive downstream setpoint.
 
 ### Visibility
-Every adaptive value is exposed as an entity attribute so you can see exactly what the system has learned and why it's doing what it's doing:
+Control estimates and diagnostics are exposed as entity attributes:
 
 | Attribute | Meaning |
 | --- | --- |
-| `decision_reason` | Plain-language description of the current tick's decision, including any active boosts and bias |
-| `adaptive_heat_overshoot` / `adaptive_cool_overshoot` | Current learned overshoot in °F per mode |
+| `decision_reason` | Plain-language description of the current control decision |
+| `filtered_room_temperature` | Median-filtered room temperature used for control |
+| `room_temperature_slope_per_minute` | Least-squares slope over recent readings |
+| `projected_room_temperature_5m` | Five-minute room-temperature projection |
+| `thermal_learning_confidence` | Confidence in the active mode/fan/outdoor model (0–1) |
+| `thermal_learning` | Persistent learned rates, post-stop drift, sample counts, and detected sensor moves |
+| `settling_remaining_seconds` | Time before a post-cycle restart is allowed |
 | `downstream_sensor_bias` | Smoothed delta between minisplit sensor and room sensor |
 | `downstream_sensor_stale` | True when the minisplit sensor has frozen |
 | `downstream_sensor_age_s` | Seconds since the minisplit sensor last reported a new value |
-| `setpoint_boost` | Current within-cycle setpoint push (resets per cycle) |
-| `fan_boost` | Current within-cycle fan-tier escalation (resets per cycle) |
-| `recent_heat_starts` / `recent_cool_starts` | Recent cycle start timestamps used by the overshoot logic |
-| `sustain_heat_active` / `sustain_cool_active` | Whether sustain mode is currently engaged per mode |
-| `sustain_heat_preferred` / `sustain_cool_preferred` | Learned preference that this mode enters sustain automatically |
-| `sustain_fan_tier_idx` | Current fan tier index while in sustain |
+| `recent_heat_starts` / `recent_cool_starts` | Recent cycle start timestamps for diagnostics |
 
 ## Configuration
 
 ### Setup (initial)
 
-When you add the integration, you only need to provide the essentials. Everything else uses smart defaults and the adaptive control system handles tuning automatically.
+When you add the integration, you only need to provide the essentials. Everything else uses conservative defaults.
 
 | Field | Meaning | Default |
 | --- | --- | --- |
@@ -97,19 +83,20 @@ After setup, use **Configure** on the integration entry to adjust heat/cool targ
 
 ### Options (Configure → Advanced Settings)
 
-For power users. Most installs won't need to touch these — the adaptive systems handle tuning.
+For power users. Most installs should begin with the defaults and tune from observed room history.
 
 | Field | Meaning | Default |
 | --- | --- | --- |
 | Deadband | Hysteresis before starting a cycle (°F) | 0.5 |
 | Setpoint offset | Degrees past the target to push the downstream setpoint | 4 |
 | Minimum cycle time | Seconds to wait between transitions | 300 |
+| Settling time | Seconds to observe room mixing after shutdown before restarting | 900 |
 | Control loop interval | Safety-net tick in addition to sensor updates (s) | 30 |
 | Start measurement delay | Seconds to ignore stop threshold after cycle start (avoids sensor blowby false stops) | 120 |
 | Room sensor stale minutes | If the room sensor hasn't updated in this many minutes, treat it as lost and trigger emergency mode (0 to disable) | 60 |
 | Fan tiers (4 tiers) | Maps error-from-target to a fan mode name. Defaults: ≤1°F → `low`, ≤3°F → `medium`, ≤5°F → `high`, everything else → `turbo`. Fan mode names are free-form strings, so any downstream unit's naming works. | See left |
 | Emergency fallback | When the room sensor goes offline or stale: optionally force heat/cool based on outdoor temp to protect the room. | Enabled |
-| Outdoor temp sensor | For emergency fallback decisions | — |
+| Outdoor temp sensor | For seasonal learning and emergency fallback decisions | — |
 | Emergency thresholds | Force heat below 40°F outdoor, force cool above 90°F outdoor | 40 / 90 |
 | Emergency setpoints | Conservative fixed setpoints during emergency | Heat 62°F, Cool 80°F |
 | Emergency fan mode | Fan mode during emergency | `high` |
