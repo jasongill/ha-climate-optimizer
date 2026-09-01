@@ -24,11 +24,59 @@ MIN_VALID_RATE = 0.005
 MAX_VALID_RATE = 0.5
 SENSOR_MOVE_DELTA = 3.0
 SENSOR_MOVE_WINDOW = timedelta(minutes=10)
+PREDICTIVE_STOP_MIN_CONFIDENCE = 0.5
+PREDICTIVE_STOP_MAX_EARLY_DELTA = 0.5
 
 
 def _mode_direction(mode: str) -> int:
     """Return the expected temperature direction for an active HVAC mode."""
     return -1 if mode == "cool" else 1
+
+
+def confidence_aware_stop(
+    *,
+    cooling: bool,
+    current: float,
+    projected: float,
+    target: float,
+    confidence: float,
+    slope_per_minute: float | None,
+) -> tuple[bool, str]:
+    """Return whether a cycle should stop without trusting a weak forecast.
+
+    The measured/filtered room temperature always wins. A projection may stop
+    a cycle early only when the learned model is at least moderately confident,
+    the live trend is moving in the commanded direction, and the early cutoff
+    is bounded to at most half a degree.
+    """
+    measured_reached = current <= target if cooling else current >= target
+    if measured_reached:
+        return True, "measured target reached"
+
+    if confidence < PREDICTIVE_STOP_MIN_CONFIDENCE:
+        return False, "prediction confidence too low"
+
+    moving_correctly = (
+        slope_per_minute is not None
+        and (slope_per_minute < 0 if cooling else slope_per_minute > 0)
+    )
+    if not moving_correctly:
+        return False, "room trend is not moving toward target"
+
+    early_delta = min(
+        PREDICTIVE_STOP_MAX_EARLY_DELTA,
+        PREDICTIVE_STOP_MAX_EARLY_DELTA
+        * (confidence - PREDICTIVE_STOP_MIN_CONFIDENCE)
+        / (1.0 - PREDICTIVE_STOP_MIN_CONFIDENCE),
+    )
+    early_threshold = target + early_delta if cooling else target - early_delta
+    projection_reached = projected <= target if cooling else projected >= target
+    within_early_window = (
+        current <= early_threshold if cooling else current >= early_threshold
+    )
+    if projection_reached and within_early_window:
+        return True, f"high-confidence projection within {early_delta:.2f}°F"
+    return False, "continuing gently toward measured target"
 
 
 @dataclass(frozen=True)

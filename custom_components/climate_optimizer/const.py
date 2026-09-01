@@ -64,7 +64,7 @@ DEFAULT_COOL_TARGET = 74.0
 DEFAULT_DEADBAND = 0.5
 DEFAULT_SETPOINT_OFFSET = 4.0
 DEFAULT_MIN_CYCLE_TIME = 300  # seconds
-DEFAULT_SETTLING_TIME = 900  # seconds to observe room mixing after shutdown
+DEFAULT_SETTLING_TIME = 120  # maximum seconds to observe room mixing after shutdown
 DEFAULT_TICK_INTERVAL = 30  # seconds
 DEFAULT_START_MEASUREMENT_DELAY = 120  # seconds
 

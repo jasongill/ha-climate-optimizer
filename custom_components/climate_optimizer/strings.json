@@ -56,7 +56,7 @@
           "deadband": "Hysteresis / deadband (\u00b0F)",
           "setpoint_offset": "Setpoint offset pushed to mini split (\u00b0F)",
           "min_cycle_time": "Minimum off time before restart (seconds)",
-          "settling_time": "Room settling time after shutdown (seconds)",
+          "settling_time": "Maximum room mixing time after shutdown (seconds)",
           "tick_interval": "Control loop interval (seconds)",
           "start_measurement_delay": "Sensor settle delay after cycle start (seconds)",
           "room_sensor_stale_minutes": "Treat room sensor as lost if no update for this many minutes (0 to disable)",

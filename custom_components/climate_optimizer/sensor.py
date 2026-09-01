@@ -90,6 +90,22 @@ class ClimateOptimizerStatusSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
             "decision_reason": self._climate_attr("decision_reason"),
+            "settling_remaining_seconds": self._climate_attr(
+                "settling_remaining_seconds"
+            ),
+            "settling_exit_reason": self._climate_attr("settling_exit_reason"),
+            "filtered_room_temperature": self._climate_attr(
+                "filtered_room_temperature"
+            ),
+            "room_temperature_slope_per_minute": self._climate_attr(
+                "room_temperature_slope_per_minute"
+            ),
+            "projected_room_temperature_5m": self._climate_attr(
+                "projected_room_temperature_5m"
+            ),
+            "thermal_learning_confidence": self._climate_attr(
+                "thermal_learning_confidence"
+            ),
         }
 
     @property

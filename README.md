@@ -25,7 +25,7 @@ The state machine uses hysteresis, temperature trajectory, and an explicit post-
 - **Start cooling** when the room climbs to `cool_target + deadband`. Command the downstream unit to `cool` with a setpoint pushed `setpoint_offset` degrees **below** the cool target, so the unit actually runs instead of thinking it is already at temperature.
 - **Start heating** when the room drops to `heat_target - deadband`. Mirror image: command `heat` with a setpoint pushed `setpoint_offset` degrees **above** the heat target.
 - **Ease off near target** by shrinking the downstream setpoint offset toward 2°F. This lets an inverter run longer at lower output instead of repeatedly demanding maximum capacity.
-- **Stop predictively** when the filtered room temperature or its learned five-minute projection reaches the target, then observe a configurable settling period before another cycle.
+- **Stop conservatively** at the filtered room target, or slightly early only when a high-confidence five-minute projection agrees with the live trend. Afterward, observe room mixing only while demand remains satisfied; crossing a normal start threshold ends the mixing window immediately.
 - On every tick, the commanded fan mode is re-evaluated based on the current error from the target band and the configured fan tiers.
 
 Downstream commands are de-duplicated — the integration only resends mode/setpoint/fan changes when they actually differ from the downstream entity's current state.
@@ -90,7 +90,7 @@ For power users. Most installs should begin with the defaults and tune from obse
 | Deadband | Hysteresis before starting a cycle (°F) | 0.5 |
 | Setpoint offset | Degrees past the target to push the downstream setpoint | 4 |
 | Minimum cycle time | Seconds to wait between transitions | 300 |
-| Settling time | Seconds to observe room mixing after shutdown before restarting | 900 |
+| Maximum room mixing time | Maximum seconds to observe room mixing after shutdown while demand remains satisfied | 120 |
 | Control loop interval | Safety-net tick in addition to sensor updates (s) | 30 |
 | Start measurement delay | Seconds to ignore stop threshold after cycle start (avoids sensor blowby false stops) | 120 |
 | Room sensor stale minutes | If the room sensor hasn't updated in this many minutes, treat it as lost and trigger emergency mode (0 to disable) | 60 |

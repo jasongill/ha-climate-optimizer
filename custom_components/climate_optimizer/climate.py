@@ -87,8 +87,8 @@ from .const import (
 from .control import (
     ThermalLearner,
     TemperatureTracker,
+    confidence_aware_stop,
     gentle_setpoint_offset,
-    projected_stop,
 )
 from .fan_limit import fan_limit_signal
 
@@ -259,6 +259,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._filtered_room_temp: float | None = None
         self._room_temp_slope: float | None = None
         self._projected_room_temp: float | None = None
+        self._settling_exit_reason: str | None = None
 
         # Recent starts are exposed for diagnostics and future replay tuning.
         self._cycle_starts: dict[HVACMode, list[datetime]] = {
@@ -418,6 +419,13 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             )
             return text, "mdi:timer-sand"
 
+        if reason.startswith("SETTLING"):
+            remaining = self._settling_remaining_s()
+            return (
+                f"Mixing air {remaining}s — demand satisfied",
+                "mdi:timer-sand",
+            )
+
         active = self._active_mode
         if active in (HVACMode.HEAT, HVACMode.COOL):
             if active == HVACMode.HEAT:
@@ -484,6 +492,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "deadband": self._deadband,
             "settling_time": self._settling_time,
             "settling_remaining_seconds": self._settling_remaining_s(),
+            "settling_exit_reason": self._settling_exit_reason,
             "error_from_band": self._last_error,
             "filtered_room_temperature": self._filtered_room_temp,
             "room_temperature_slope_per_minute": (
@@ -710,12 +719,13 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         if desired is None:
             # Idle: decide whether to start a cycle.
             settling_remaining = self._settling_remaining_s()
-            if settling_remaining:
-                self._decision_reason = (
-                    f"SETTLING: observing room mixing for {settling_remaining}s "
-                    "before another cycle"
-                )
-            elif allow_cool and control_temp > self._cool_target + self._deadband:
+            if allow_cool and control_temp > self._cool_target + self._deadband:
+                if settling_remaining:
+                    self._settle_until = None
+                    self._settling_exit_reason = (
+                        f"cooling demand returned at {control_temp:.1f}°F, above "
+                        f"{self._cool_target + self._deadband:.1f}°F threshold"
+                    )
                 desired = HVACMode.COOL
                 transition_reason = (
                     f"Starting COOL: filtered room {control_temp:.1f}°F > "
@@ -724,6 +734,12 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     f"{self._cool_target + self._deadband:.1f}°F)"
                 )
             elif allow_heat and control_temp < self._heat_target - self._deadband:
+                if settling_remaining:
+                    self._settle_until = None
+                    self._settling_exit_reason = (
+                        f"heating demand returned at {control_temp:.1f}°F, below "
+                        f"{self._heat_target - self._deadband:.1f}°F threshold"
+                    )
                 desired = HVACMode.HEAT
                 transition_reason = (
                     f"Starting HEAT: filtered room {control_temp:.1f}°F < "
@@ -731,7 +747,12 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                     f"({self._heat_target:.1f} − {self._deadband:.1f} = "
                     f"{self._heat_target - self._deadband:.1f}°F)"
                 )
-            elif not settling_remaining:
+            elif settling_remaining:
+                self._decision_reason = (
+                    f"SETTLING: mixing room air for up to {settling_remaining}s; "
+                    "heating and cooling demand remain satisfied"
+                )
+            else:
                 self._decision_reason = (
                     f"IDLE: filtered room {control_temp:.1f}°F is inside target band "
                     f"{self._heat_target:.1f}–{self._cool_target:.1f}°F "
@@ -753,11 +774,15 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 outdoor_temperature=outdoor_temp,
             )
             self._projected_room_temp = round(projected, 2)
-            stopped = projected_stop(
+            stopped, stop_reason = confidence_aware_stop(
                 cooling=desired == HVACMode.COOL,
                 current=control_temp,
                 projected=projected,
                 target=stop_at,
+                confidence=self._learning_confidence,
+                slope_per_minute=(
+                    estimate.slope_per_minute if estimate is not None else None
+                ),
             )
             # Suppress the stop check during the post-start sensor-settle
             # window: the downstream blower can spike a nearby room sensor
@@ -778,7 +803,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 transition_reason = (
                     f"Ending {desired.value.upper()}: filtered room "
                     f"{control_temp:.1f}°F, projected {projected:.1f}°F "
-                    f"reached stop {stop_at:.1f}°F"
+                    f"reached stop {stop_at:.1f}°F ({stop_reason})"
                 )
                 desired = None
 
@@ -806,6 +831,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                 self._settle_until = dt_util.utcnow() + timedelta(
                     seconds=self._settling_time
                 )
+                self._settling_exit_reason = None
                 self._attr_hvac_action = HVACAction.IDLE
                 self._last_error = 0.0
                 self._last_pushed_setpoint = None

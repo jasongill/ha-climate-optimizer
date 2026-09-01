@@ -21,6 +21,7 @@ TemperatureTracker = _CONTROL.TemperatureTracker
 ThermalLearner = _CONTROL.ThermalLearner
 gentle_setpoint_offset = _CONTROL.gentle_setpoint_offset
 projected_stop = _CONTROL.projected_stop
+confidence_aware_stop = _CONTROL.confidence_aware_stop
 
 
 class TemperatureTrackerTests(unittest.TestCase):
@@ -106,6 +107,63 @@ class ProjectedStopTests(unittest.TestCase):
                 target=74.5,
             )
         )
+
+    def test_low_confidence_projection_does_not_stop_early(self) -> None:
+        stopped, reason = confidence_aware_stop(
+            cooling=True,
+            current=74.3,
+            projected=73.8,
+            target=74.0,
+            confidence=0.4,
+            slope_per_minute=-0.1,
+        )
+        self.assertFalse(stopped)
+        self.assertIn("confidence", reason)
+
+    def test_measured_target_always_stops(self) -> None:
+        stopped, reason = confidence_aware_stop(
+            cooling=True,
+            current=74.0,
+            projected=75.0,
+            target=74.0,
+            confidence=0.0,
+            slope_per_minute=0.1,
+        )
+        self.assertTrue(stopped)
+        self.assertIn("measured", reason)
+
+    def test_high_confidence_projection_stops_only_near_target(self) -> None:
+        stopped, _ = confidence_aware_stop(
+            cooling=True,
+            current=74.4,
+            projected=73.9,
+            target=74.0,
+            confidence=1.0,
+            slope_per_minute=-0.1,
+        )
+        self.assertTrue(stopped)
+
+        far_from_target, _ = confidence_aware_stop(
+            cooling=True,
+            current=75.0,
+            projected=73.9,
+            target=74.0,
+            confidence=1.0,
+            slope_per_minute=-0.2,
+        )
+        self.assertFalse(far_from_target)
+
+    def test_projection_never_stops_against_live_trend(self) -> None:
+        stopped, reason = confidence_aware_stop(
+            cooling=True,
+            current=74.2,
+            projected=73.9,
+            target=74.0,
+            confidence=1.0,
+            slope_per_minute=0.02,
+        )
+        self.assertFalse(stopped)
+        self.assertIn("trend", reason)
 
 
 class ThermalLearnerTests(unittest.TestCase):
