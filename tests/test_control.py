@@ -281,6 +281,18 @@ class ThermalLearnerTests(unittest.TestCase):
         learned = learner.as_dict()["post_stop"]["cool"]["drift"]
         self.assertAlmostEqual(learned, -0.1)
 
+    def test_reset_observation_preserves_learning_without_bridging_gap(self) -> None:
+        learner = ThermalLearner()
+        start = datetime(2026, 8, 28, 14, 0, tzinfo=timezone.utc)
+        learner.observe(start, 76.0, "cool", "low")
+        learner.observe(start + timedelta(minutes=5), 75.5, "cool", "low")
+        learned = learner.as_dict()
+        learner.reset_observation()
+        learner.observe(start + timedelta(minutes=10), 74.5, "cool", "low")
+        self.assertEqual(learner.as_dict(), learned)
+        learner.observe(start + timedelta(minutes=15), 74.0, "cool", "low")
+        self.assertEqual(learner.as_dict()["rates"]["cool:low"]["samples"], 2)
+
     def test_restore_rejects_rate_with_wrong_mode_direction(self) -> None:
         learner = ThermalLearner()
         learner.restore(

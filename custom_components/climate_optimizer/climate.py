@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from datetime import datetime, timedelta
+from time import monotonic
 from typing import Any
 
 from homeassistant.components.climate import (
@@ -95,6 +96,9 @@ from .fan_limit import fan_limit_signal
 _LOGGER = logging.getLogger(__name__)
 
 CYCLE_HISTORY = 4
+COMMAND_RETRY_BASE_S = 30
+COMMAND_RETRY_MAX_S = 300
+COMMAND_TIMEOUT_S = 30
 
 # Downstream temperature bias: the minisplit's own sensor often disagrees
 # with the actual room because of mounting height, discharge air, or lag.
@@ -253,6 +257,8 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._last_transition: datetime | None = None
         self._settle_until: datetime | None = None
         self._last_sent: dict[str, Any] = {}
+        self._command_attempts: dict[str, tuple[float, int]] = {}
+        self._downstream_disconnected = False
         self._temperature_tracker = TemperatureTracker()
         self._thermal_learner = ThermalLearner()
         self._learning_confidence = 0.0
@@ -400,6 +406,17 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         specific / most actionable conditions win. All inputs are already
         tracked on self, so this is a pure derivation.
         """
+        ds = self.hass.states.get(self._downstream)
+        if ds is None or ds.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return "Waiting for downstream device", "mdi:lan-disconnect"
+        expected = (
+            self._active_mode.value
+            if self._active_mode and self._attr_hvac_mode != HVACMode.OFF
+            else "off"
+        )
+        if ds.state != expected:
+            requested = {"cool": "Cooling", "heat": "Heating", "off": "Off"}[expected]
+            return f"{requested} requested; device still {ds.state}", "mdi:timer-sand"
         if self._attr_hvac_mode == HVACMode.OFF:
             return "Off", "mdi:power"
         if self._emergency_active:
@@ -516,7 +533,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "last_transition": self._last_transition.isoformat()
             if self._last_transition
             else None,
-            "last_sent": self._last_sent,
+            "last_sent": dict(self._last_sent),
+            "command_attempts": {
+                key: count for key, (_, count) in self._command_attempts.items()
+            },
             "fan_limit_mode": (
                 self._fan_limit_mode_value() if self._fan_limit_active() else None
             ),
@@ -582,18 +602,19 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         await self._async_control()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        self._attr_hvac_mode = hvac_mode
-        if hvac_mode == HVACMode.OFF:
-            await self._async_stop_downstream()
-            self._active_mode = None
-            self._attr_hvac_action = HVACAction.OFF
-        elif (self._active_mode == HVACMode.COOL and hvac_mode == HVACMode.HEAT) or (
-            self._active_mode == HVACMode.HEAT and hvac_mode == HVACMode.COOL
-        ):
-            await self._async_stop_downstream()
-            self._active_mode = None
-        self.async_write_ha_state()
-        await self._async_control()
+        async with self._control_lock:
+            self._attr_hvac_mode = hvac_mode
+            if hvac_mode == HVACMode.OFF:
+                await self._async_stop_downstream()
+                self._active_mode = None
+                self._attr_hvac_action = HVACAction.OFF
+            elif (
+                self._active_mode == HVACMode.COOL and hvac_mode == HVACMode.HEAT
+            ) or (self._active_mode == HVACMode.HEAT and hvac_mode == HVACMode.COOL):
+                await self._async_stop_downstream()
+                self._active_mode = None
+            self.async_write_ha_state()
+            await self._async_control_locked()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         ds_state = self.hass.states.get(self._downstream)
@@ -618,6 +639,11 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     @callback
     def _async_state_changed(self, event: Event) -> None:
+        if event.data.get("entity_id") == self._downstream:
+            state = event.data.get("new_state")
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                self._downstream_disconnected = True
+                self._thermal_learner.reset_observation()
         self.hass.async_create_task(self._async_control())
 
     @callback
@@ -637,19 +663,30 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     async def _async_control_locked(self) -> None:
         """Run one control pass while holding the control lock."""
-        if self._attr_hvac_mode == HVACMode.OFF:
-            self._decision_reason = "Virtual device is OFF"
-            self.async_write_ha_state()
-            return
-
         ds_state = self.hass.states.get(self._downstream)
         if ds_state is None or ds_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            self._downstream_disconnected = True
+            self._thermal_learner.reset_observation()
+            self._attr_hvac_action = HVACAction.IDLE
             self._decision_reason = (
                 f"Downstream climate {self._downstream} unavailable; holding"
             )
             _LOGGER.warning(
                 "Downstream climate %s unavailable; skipping tick", self._downstream
             )
+            self.async_write_ha_state()
+            return
+
+        if self._downstream_disconnected:
+            self._last_sent.clear()
+            self._command_attempts.clear()
+            self._downstream_disconnected = False
+
+        if self._attr_hvac_mode == HVACMode.OFF:
+            await self._async_stop_downstream()
+            self._thermal_learner.reset_observation()
+            self._decision_reason = "Virtual device is OFF"
+            self._attr_hvac_action = HVACAction.OFF
             self.async_write_ha_state()
             return
 
@@ -680,6 +717,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                         sensor_issue = f"stuck (value unchanged for >{self._room_sensor_stuck_s // 3600}h)"
 
         if sensor_issue is not None:
+            self._thermal_learner.reset_observation()
             await self._async_handle_room_sensor_lost(
                 ds_state, allow_heat, allow_cool, sensor_issue=sensor_issue
             )
@@ -703,15 +741,19 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             estimate.projected_5m if estimate is not None else control_temp, 2
         )
         now = dt_util.utcnow()
-        active_fan = self._last_fan_tier if self._active_mode else None
         outdoor_temp = self._outdoor_temperature()
-        self._thermal_learner.observe(
-            now,
-            control_temp,
-            self._active_mode.value if self._active_mode else None,
-            active_fan,
-            outdoor_temp,
-        )
+        expected = self._active_mode.value if self._active_mode else "off"
+        if ds_state.state == expected:
+            self._thermal_learner.observe(
+                now,
+                control_temp,
+                self._active_mode.value if self._active_mode else None,
+                ds_state.attributes.get(ATTR_FAN_MODE) if self._active_mode else None,
+                outdoor_temp,
+            )
+        else:
+            # Do not bridge an unconfirmed interval with a later valid sample.
+            self._thermal_learner.reset_observation()
 
         desired: HVACMode | None = self._active_mode
         transition_reason: str | None = None
@@ -849,17 +891,10 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             self._last_error = 0.0
             self._last_pushed_setpoint = None
             self._last_fan_tier = None
+            await self._async_stop_downstream()
             if ds_state.state != "off":
-                _LOGGER.warning(
-                    "Downstream %s is %s while virtual device is idle; "
-                    "re-asserting off",
-                    self._downstream,
-                    ds_state.state,
-                )
-                self._last_sent = {}
-                await self._async_stop_downstream()
                 self._decision_reason = (
-                    f"IDLE: downstream was {ds_state.state}, re-asserted off. "
+                    f"OFF requested; downstream still {ds_state.state}. "
                     f"{self._decision_reason}"
                 )
             self.async_write_ha_state()
@@ -871,11 +906,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._decision_reason = (
             f"{transition_reason}. {reason}" if transition_reason else reason
         )
-        self._attr_hvac_action = (
-            HVACAction.COOLING
-            if self._active_mode == HVACMode.COOL
-            else HVACAction.HEATING
-        )
+        self._report_requested_action(self._active_mode)
         self.async_write_ha_state()
 
     # ------------------------------------------------------------------ cycle tracking
@@ -1015,9 +1046,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "Driving downstream at fixed emergency setpoint."
         )
 
-        self._attr_hvac_action = (
-            HVACAction.COOLING if desired == HVACMode.COOL else HVACAction.HEATING
-        )
+        self._report_requested_action(desired)
         self.async_write_ha_state()
 
     # ------------------------------------------------------------------ downstream drive
@@ -1134,58 +1163,86 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         fan_mode: str | None,
     ) -> None:
         """Send hvac_mode/setpoint/fan_mode to the downstream, deduped."""
-        desired_hvac = mode.value  # "heat" / "cool"
-
-        cur_mode = ds_state.state
-        cur_setpoint = ds_state.attributes.get(ATTR_TEMPERATURE)
-        cur_fan = ds_state.attributes.get(ATTR_FAN_MODE)
-
-        # A mismatch with no pending command means something external changed
-        # the unit after our previous write was confirmed.
-        if cur_mode != desired_hvac and "hvac_mode" not in self._last_sent:
-            _LOGGER.warning(
-                "Downstream %s is '%s' (expected '%s'); " "re-asserting control",
-                self._downstream,
-                cur_mode,
-                desired_hvac,
-            )
-
-        if self._should_send("hvac_mode", cur_mode, desired_hvac):
-            await self.hass.services.async_call(
-                "climate",
-                "set_hvac_mode",
-                {"entity_id": self._downstream, "hvac_mode": desired_hvac},
-                blocking=True,
-            )
-            self._last_sent["hvac_mode"] = desired_hvac
-
-        if self._should_send("setpoint", cur_setpoint, setpoint):
-            await self.hass.services.async_call(
-                "climate",
-                "set_temperature",
-                {"entity_id": self._downstream, "temperature": setpoint},
-                blocking=True,
-            )
-            self._last_sent["setpoint"] = setpoint
-
+        await self._async_command(
+            "hvac_mode", ds_state.state, mode.value, "set_hvac_mode", "hvac_mode"
+        )
+        await self._async_command(
+            "setpoint",
+            ds_state.attributes.get(ATTR_TEMPERATURE),
+            setpoint,
+            "set_temperature",
+            "temperature",
+        )
         available_fan = ds_state.attributes.get(ATTR_FAN_MODES) or []
         if fan_mode and fan_mode not in available_fan:
             fan_mode = available_fan[0] if available_fan else None
-
-        if fan_mode and self._should_send("fan_mode", cur_fan, fan_mode):
-            await self.hass.services.async_call(
-                "climate",
+        if fan_mode:
+            await self._async_command(
+                "fan_mode",
+                ds_state.attributes.get(ATTR_FAN_MODE),
+                fan_mode,
                 "set_fan_mode",
-                {"entity_id": self._downstream, "fan_mode": fan_mode},
-                blocking=True,
+                "fan_mode",
             )
-            self._last_sent["fan_mode"] = fan_mode
             self._attr_fan_mode = fan_mode
+
+    async def _async_command(
+        self, key: str, current: Any, desired: Any, service: str, field: str
+    ) -> None:
+        """Send an attempt, retaining failures for bounded retry on later ticks."""
+        if not self._should_send(key, current, desired):
+            return
+        previous = self._command_attempts.get(key, (0.0, 0))[1]
+        count = previous + 1 if self._last_sent.get(key) == desired else 1
+        # Record before yielding so errors and delayed acknowledgments cannot
+        # cause a tight retry loop. A service return is not device confirmation.
+        self._last_sent[key] = desired
+        self._command_attempts[key] = (monotonic(), count)
+        if count > 1:
+            _LOGGER.warning(
+                "Downstream %s has not confirmed %s=%s; retry attempt %s",
+                self._downstream,
+                key,
+                desired,
+                count,
+            )
+        try:
+            await asyncio.wait_for(
+                self.hass.services.async_call(
+                    "climate",
+                    service,
+                    {"entity_id": self._downstream, field: desired},
+                    blocking=True,
+                ),
+                timeout=COMMAND_TIMEOUT_S,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Downstream %s command %s=%s failed; will retry",
+                self._downstream,
+                key,
+                desired,
+            )
+
+    def _report_requested_action(self, mode: HVACMode) -> None:
+        """Distinguish requested operation from downstream mode confirmation."""
+        state = self.hass.states.get(self._downstream)
+        if state is None or state.state != mode.value:
+            actual = state.state if state is not None else "unavailable"
+            self._attr_hvac_action = HVACAction.IDLE
+            self._decision_reason = (
+                f"{mode.value.upper()} requested; downstream still {actual}. "
+                "Waiting for confirmation; unconfirmed commands retry automatically."
+            )
+            return
+        self._attr_hvac_action = (
+            HVACAction.COOLING if mode == HVACMode.COOL else HVACAction.HEATING
+        )
 
     async def _async_go_idle(self) -> None:
         """Stop downstream and clear active state."""
+        await self._async_stop_downstream()
         if self._active_mode is not None or self._emergency_active:
-            await self._async_stop_downstream()
             self._active_mode = None
             self._emergency_active = False
             self._last_transition = dt_util.utcnow()
@@ -1195,13 +1252,18 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._last_fan_tier = None
 
     async def _async_stop_downstream(self) -> None:
-        await self.hass.services.async_call(
-            "climate",
-            "set_hvac_mode",
-            {"entity_id": self._downstream, "hvac_mode": "off"},
-            blocking=True,
+        # Discard superseded actuator requests, but preserve an outstanding OFF
+        # attempt so repeated idle ticks respect its backoff.
+        for key in ("setpoint", "fan_mode"):
+            self._last_sent.pop(key, None)
+            self._command_attempts.pop(key, None)
+        state = self.hass.states.get(self._downstream)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            self._downstream_disconnected = True
+            return
+        await self._async_command(
+            "hvac_mode", state.state, "off", "set_hvac_mode", "hvac_mode"
         )
-        self._last_sent = {"hvac_mode": "off"}
 
     # ------------------------------------------------------------------ helpers
 
@@ -1238,8 +1300,16 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             # The downstream confirmed an earlier write. Removing the pending
             # marker lets a subsequent manual/cloud change be re-asserted.
             self._last_sent.pop(key, None)
+            self._command_attempts.pop(key, None)
             return False
-        return self._last_sent.get(key) != desired
+        if self._last_sent.get(key) != desired:
+            return True
+        attempt = self._command_attempts.get(key)
+        if attempt is None:
+            return True
+        sent_at, count = attempt
+        delay = min(COMMAND_RETRY_MAX_S, COMMAND_RETRY_BASE_S * 2 ** min(count - 1, 4))
+        return monotonic() - sent_at >= delay
 
     def _fan_limit_active(self) -> bool:
         """Return whether the temporary fan cap is still active."""

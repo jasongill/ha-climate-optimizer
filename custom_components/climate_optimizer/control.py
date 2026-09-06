@@ -189,6 +189,11 @@ class ThermalLearner:
         old.rate = (1 - alpha) * old.rate + alpha * bounded
         old.samples = min(1000, old.samples + 1)
 
+    def reset_observation(self) -> None:
+        """Break the sample interval after missing or unconfirmed operation."""
+        self._last = None
+        self._settling = None
+
     def observe(
         self,
         timestamp: datetime,

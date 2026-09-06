@@ -4,6 +4,27 @@ A Home Assistant custom integration that wraps a "dumb" climate device (such as 
 
 Each virtual climate device pairs one room sensor with one downstream climate entity and runs its own control loop, so you can get tight room-level behavior out of equipment that would otherwise let temperature drift or idle its indoor fan 24/7.
 
+## v0.9.2 — recovery from unconfirmed commands
+
+- Lost mode, temperature, and fan commands retry after 30 seconds, then 60,
+  120, 240, and at most 300 seconds between attempts. Retries run on the next
+  control event or configured timer tick after that delay; confirmed commands
+  are not repeated. Service calls time out after 30 seconds.
+- A downstream disconnect clears stale pending commands on recovery, including
+  brief disconnects. The controller reconciles the current demand automatically.
+- Off commands also retry, including when the virtual thermostat is switched off
+  while the split is disconnected. Manual mode changes serialize with the control
+  loop so an in-flight cooling pass cannot overwrite an off request.
+- Status distinguishes requested heating/cooling from the downstream's confirmed
+  mode. `last_sent` and `command_attempts` expose outstanding requests; retries and
+  service failures are logged.
+- Thermal learning skips unconfirmed operation and breaks observations across
+  disconnects or missing room-sensor data, preserving previously learned values.
+
+Confirmation means the downstream HA entity reports the requested mode; it does
+not independently verify compressor operation. Existing room-sensor safeguards,
+comfort targets, and minimum-cycle rules continue to apply.
+
 ## What it does
 
 For every virtual climate device you create, the integration:
