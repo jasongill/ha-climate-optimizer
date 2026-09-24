@@ -4,6 +4,13 @@ A Home Assistant custom integration that wraps a "dumb" climate device (such as 
 
 Each virtual climate device pairs one room sensor with one downstream climate entity and runs its own control loop, so you can get tight room-level behavior out of equipment that would otherwise let temperature drift or idle its indoor fan 24/7.
 
+## v0.9.3 — temperature controls match the selected mode
+
+- Cool mode shows a single cooling setpoint (blue), and heat mode shows a single
+  heating setpoint (red). Heat/cool mode keeps the combined red/blue range.
+- Adjusting a single setpoint updates only the selected mode's target.
+- Both targets persist across restarts, including while in heat or cool mode.
+
 ## v0.9.2 — recovery from unconfirmed commands
 
 - Lost mode, temperature, and fan commands retry after 30 seconds, then 60,

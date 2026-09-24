@@ -168,8 +168,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         HVACMode.COOL,
     ]
     _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
-        | ClimateEntityFeature.FAN_MODE
+        ClimateEntityFeature.FAN_MODE
         | ClimateEntityFeature.TURN_ON
         | ClimateEntityFeature.TURN_OFF
     )
@@ -300,8 +299,8 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         last_state = await self.async_get_last_state()
         if last_state is not None:
             attrs = last_state.attributes
-            low = attrs.get("target_temp_low")
-            high = attrs.get("target_temp_high")
+            low = attrs.get("heat_target", attrs.get("target_temp_low"))
+            high = attrs.get("cool_target", attrs.get("target_temp_high"))
             try:
                 if low is not None and high is not None:
                     low_f = float(low)
@@ -367,6 +366,25 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self.hass.async_create_task(self._async_control())
 
     # ------------------------------------------------------------------ properties
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        """Expose a single setpoint for heat/cool and a range otherwise."""
+        temperature_feature = (
+            ClimateEntityFeature.TARGET_TEMPERATURE
+            if self._attr_hvac_mode in (HVACMode.HEAT, HVACMode.COOL)
+            else ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        )
+        return self._attr_supported_features | temperature_feature
+
+    @property
+    def target_temperature(self) -> float | None:
+        """Return the setpoint for the selected single-temperature mode."""
+        if self._attr_hvac_mode == HVACMode.HEAT:
+            return self._heat_target
+        if self._attr_hvac_mode == HVACMode.COOL:
+            return self._cool_target
+        return None
 
     @property
     def current_temperature(self) -> float | None:
@@ -570,6 +588,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         high = kwargs.get("target_temp_high")
         single = kwargs.get(ATTR_TEMPERATURE)
         hvac_mode = kwargs.get(ATTR_HVAC_MODE)
+        effective_mode = hvac_mode or self._attr_hvac_mode
 
         # Compute proposed targets without mutating self yet — that way an
         # invalid range leaves the entity in its previous good state.
@@ -580,10 +599,15 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         if high is not None:
             new_cool = float(high)
         if single is not None and low is None and high is None:
-            mid = float(single)
-            half = (new_cool - new_heat) / 2 or 2.5
-            new_heat = mid - half
-            new_cool = mid + half
+            if effective_mode == HVACMode.HEAT:
+                new_heat = float(single)
+            elif effective_mode == HVACMode.COOL:
+                new_cool = float(single)
+            else:
+                mid = float(single)
+                half = (new_cool - new_heat) / 2 or 2.5
+                new_heat = mid - half
+                new_cool = mid + half
 
         if new_heat >= new_cool:
             _LOGGER.warning(

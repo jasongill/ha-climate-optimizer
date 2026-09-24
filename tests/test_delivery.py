@@ -38,7 +38,8 @@ class HVACAction(str, Enum):
 
 
 class ClimateEntity:
-    pass
+    async def async_added_to_hass(self):
+        pass
 
 
 class RestoreEntity:
@@ -53,7 +54,8 @@ NS.update(
     ClimateEntity=ClimateEntity,
     RestoreEntity=RestoreEntity,
     ClimateEntityFeature=SimpleNamespace(
-        TARGET_TEMPERATURE_RANGE=1, FAN_MODE=2, TURN_ON=4, TURN_OFF=8
+        TARGET_TEMPERATURE_RANGE=1, FAN_MODE=2, TURN_ON=4, TURN_OFF=8,
+        TARGET_TEMPERATURE=16,
     ),
     UnitOfTemperature=SimpleNamespace(FAHRENHEIT="°F"),
     DeviceInfo=dict,
@@ -141,6 +143,59 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         await self.device._async_command(
             "hvac_mode", current, desired, "set_hvac_mode", "hvac_mode"
         )
+
+    async def test_temperature_controls_follow_selected_mode(self):
+        features = NS["ClimateEntityFeature"]
+        for mode, target in (
+            (HVACMode.COOL, 72),
+            (HVACMode.HEAT, self.device._heat_target),
+            (HVACMode.HEAT_COOL, None),
+            (HVACMode.OFF, None),
+        ):
+            with self.subTest(mode=mode):
+                await self.device.async_set_hvac_mode(mode)
+                single = mode in (HVACMode.HEAT, HVACMode.COOL)
+                self.assertEqual(self.device.target_temperature, target)
+                self.assertEqual(
+                    bool(self.device.supported_features & features.TARGET_TEMPERATURE),
+                    single,
+                )
+                self.assertEqual(
+                    bool(self.device.supported_features & features.TARGET_TEMPERATURE_RANGE),
+                    not single,
+                )
+
+    async def test_single_setpoint_edits_only_selected_target(self):
+        await self.device.async_set_temperature(hvac_mode=HVACMode.HEAT, temperature=65)
+        self.assertEqual((self.device._heat_target, self.device._cool_target), (65, 72))
+        await self.device.async_set_hvac_mode(HVACMode.COOL)
+        await self.device.async_set_temperature(temperature=75)
+        self.assertEqual((self.device._heat_target, self.device._cool_target), (65, 75))
+        await self.device.async_set_hvac_mode(HVACMode.HEAT_COOL)
+        self.assertEqual(self.device.target_temperature_low, 65)
+        self.assertEqual(self.device.target_temperature_high, 75)
+        await self.device.async_set_temperature(target_temp_low=66, target_temp_high=76)
+        self.assertEqual((self.device._heat_target, self.device._cool_target), (66, 76))
+
+    async def test_targets_restore_in_single_and_legacy_range_modes(self):
+        for mode in (HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL):
+            with self.subTest(mode=mode):
+                self.device._heat_target, self.device._cool_target = 65, 75
+                attrs = self.device.extra_state_attributes
+                if mode == HVACMode.HEAT_COOL:
+                    attrs = {"target_temp_low": 65, "target_temp_high": 75}
+                self.device._heat_target, self.device._cool_target = 62, 72
+                self.device.async_get_last_state = AsyncMock(return_value=state(mode, **attrs))
+                self.device.async_on_remove = Mock()
+                with patch.dict(NS, {
+                    "async_track_state_change_event": Mock(),
+                    "async_track_time_interval": Mock(),
+                    "async_dispatcher_connect": Mock(),
+                    "fan_limit_signal": Mock(),
+                }):
+                    await self.device.async_added_to_hass()
+                self.assertEqual((self.device._heat_target, self.device._cool_target), (65, 75))
+                self.assertEqual(self.device._attr_hvac_mode, mode)
 
     async def test_lost_start_retries_without_virtual_toggle(self):
         await self.device._async_control()
