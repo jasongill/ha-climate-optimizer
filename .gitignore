@@ -60,3 +60,4 @@ home-assistant_v2.db*
 .envrc
 scratch/
 tmp/
+.worktrees/
