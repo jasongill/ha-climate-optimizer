@@ -114,3 +114,9 @@ FAN_TIER_KEYS: list[tuple[str, float, str, str]] = [
         DEFAULT_FAN_TIER_4_MODE,
     ),
 ]
+
+# Recovery is opt-in per device; the cap is additional to the gentle offset.
+CONF_RECOVERY_MAX_OFFSET = "recovery_max_offset"
+CONF_RECOVERY_DELAY = "recovery_delay"
+DEFAULT_RECOVERY_MAX_OFFSET = 0.0
+DEFAULT_RECOVERY_DELAY = 25  # minutes

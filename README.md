@@ -62,7 +62,7 @@ Downstream commands are de-duplicated — the integration only resends mode/setp
 
 Remote room sensors react more slowly than air at a wall-mounted mini split. The integration keeps a de-duplicated 20-minute sample buffer, filters the three most recent readings with a median, and fits a temperature slope over the last 10 minutes. A five-minute projection allows cooling or heating to stop before sensor lag carries the room through the target.
 
-The configured downstream offset is a maximum. Within 1°F of target, the controller uses at most a 2°F offset; from 1–3°F error it interpolates smoothly toward the configured maximum. Fan mode continues to follow the configured tiers, but the controller never automatically boosts past the natural tier.
+The configured downstream offset is the maximum base offset. Within 1°F of target, the controller uses at most a 2°F offset; from 1–3°F error it interpolates smoothly toward the configured maximum. Fan mode continues to follow the configured tiers, but the controller never automatically boosts past the natural tier.
 
 The mini split's own temperature bias is retained as a diagnostic attribute but does not increase demand. This avoids extreme commands when a wall-unit sensor is stale or reads in the cold/warm discharge plume.
 
@@ -116,7 +116,9 @@ For power users. Most installs should begin with the defaults and tune from obse
 | Field | Meaning | Default |
 | --- | --- | --- |
 | Deadband | Hysteresis before starting a cycle (°F) | 0.5 |
-| Setpoint offset | Degrees past the target to push the downstream setpoint | 4 |
+| Setpoint offset | Maximum base offset past the target | 4 |
+| Maximum additional recovery offset | Extra offset for sustained stalls; 0 disables, maximum 6°F | 0 |
+| Recovery delay | Minutes of insufficient progress before the first boost (10–120) | 25 |
 | Minimum cycle time | Seconds to wait between transitions | 300 |
 | Maximum room mixing time | Maximum seconds to observe room mixing after shutdown while demand remains satisfied | 120 |
 | Control loop interval | Safety-net tick in addition to sensor updates (s) | 30 |
@@ -136,6 +138,42 @@ Emergency mode respects the virtual entity's current `hvac_mode` — if you've s
 Each virtual device provides **Maximum Fan Speed** and **Fan Limit Duration** entities for dashboards and automations. Set the duration, then select a maximum speed such as `low`; selecting `Disabled` clears the cap. The default duration is four hours.
 
 The same controls remain available under **Configure → Temporary Fan Limit**, along with the maximum duration exposed by the dashboard number entity (24 hours by default). Dashboard changes apply live without restarting the climate control loop. The limit survives Home Assistant restarts and expires automatically. Emergency fallback is intentionally allowed to exceed this cap.
+
+### Optional stalled-room recovery
+
+Enable recovery separately for each virtual device under **Configure → Advanced
+Settings** by setting **Maximum additional recovery offset** above zero. It is
+**disabled by default** for new and existing devices. A conservative initial trial
+is a 2°F additional cap with the default 25-minute observation window.
+
+This addresses a room that stays cold (or hot) while the mini split's own sensor
+thinks it has reached its setpoint. Recovery uses the room's measured progress,
+not the difference between the unit and room sensors. While the downstream mode
+is confirmed, after startup settling, a shortfall of at least 0.5°F with less than
+0.25°F net progress over the observation window adds 0.5°F to the effective
+setpoint offset. Continued stalls add another 0.5°F no more often than every ten
+minutes, up to the configured additional cap (0–6°F). Cooling subtracts this
+compensation from the commanded setpoint; heating adds it.
+
+Each 0.25°F of recovery reduces accumulated compensation by 0.5°F and restarts
+the observation window. Inside the last 0.5°F to target, compensation tapers to
+zero. Normal measured/predictive stopping still takes priority. Fan tiers and
+temporary fan limits are unchanged. The base offset plus recovery can exceed
+`setpoint_offset`, but is limited by the additional cap and downstream temperature
+limits. The accumulator is clipped to available actuator headroom.
+
+Recovery resets on shutdown, a new cycle, target/mode changes, invalid or lost
+room data, downstream unavailability/unconfirmed mode, or a control-observation
+gap longer than five minutes. It is not restored after restart. Short modulation
+or defrost pauses do not immediately raise demand; confirmed mode is not a direct
+measurement of compressor operation or defrost. Recovery is not a diagnosis of
+insufficient heating capacity.
+
+Diagnostic attributes `recovery_offset` (additional °F before downstream rounding),
+`recovery_max_offset`, and `recovery_reason` explain the current action. Monitor
+room shortfall, overshoot, and cycling during a trial; set the cap back to zero
+to disable it. Enable this selectively rather than increasing demand in rooms
+already holding their targets.
 
 ## Control source
 
