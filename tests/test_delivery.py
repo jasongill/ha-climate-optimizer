@@ -79,6 +79,7 @@ for attr in (
 ):
     NS["ATTR_" + attr] = attr.lower()
 for name in (
+    "RecoveryCompensator",
     "ThermalLearner",
     "TemperatureTracker",
     "confidence_aware_stop",

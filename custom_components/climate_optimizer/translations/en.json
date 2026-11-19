@@ -75,7 +75,9 @@
           "emergency_cool_above_outdoor": "Emergency: force cool when outdoor is above (\u00b0F)",
           "emergency_heat_setpoint": "Emergency heat setpoint sent to mini split (\u00b0F)",
           "emergency_cool_setpoint": "Emergency cool setpoint sent to mini split (\u00b0F)",
-          "emergency_fan_mode": "Emergency fan mode"
+          "emergency_fan_mode": "Emergency fan mode",
+          "recovery_max_offset": "Maximum additional recovery offset (\u00b0F; 0 disables, up to 6)",
+          "recovery_delay": "Time without meaningful room recovery before boosting (minutes)"
         }
       }
     },

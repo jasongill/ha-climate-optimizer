@@ -31,6 +31,8 @@ from .const import (
     CONF_HEAT_TARGET,
     CONF_MIN_CYCLE_TIME,
     CONF_OUTDOOR_TEMP_SENSOR,
+    CONF_RECOVERY_DELAY,
+    CONF_RECOVERY_MAX_OFFSET,
     CONF_ROOM_SENSOR_STALE_MINUTES,
     CONF_ROOM_SENSOR_STUCK_HOURS,
     CONF_SETTLING_TIME,
@@ -52,6 +54,8 @@ from .const import (
     DEFAULT_FAN_LIMIT_MAX_HOURS,
     DEFAULT_HEAT_TARGET,
     DEFAULT_MIN_CYCLE_TIME,
+    DEFAULT_RECOVERY_DELAY,
+    DEFAULT_RECOVERY_MAX_OFFSET,
     DEFAULT_ROOM_SENSOR_STALE_MINUTES,
     DEFAULT_ROOM_SENSOR_STUCK_HOURS,
     DEFAULT_SETTLING_TIME,
@@ -141,6 +145,14 @@ def _target_fields(values: dict[str, Any]) -> dict[Any, Any]:
 def _advanced_control_fields(values: dict[str, Any]) -> dict[Any, Any]:
     """Timing and tuning knobs — only shown in options."""
     return {
+        vol.Required(
+            CONF_RECOVERY_MAX_OFFSET,
+            default=values.get(CONF_RECOVERY_MAX_OFFSET, DEFAULT_RECOVERY_MAX_OFFSET),
+        ): vol.All(vol.Coerce(float), vol.Range(min=0, max=6)),
+        vol.Required(
+            CONF_RECOVERY_DELAY,
+            default=values.get(CONF_RECOVERY_DELAY, DEFAULT_RECOVERY_DELAY),
+        ): vol.All(vol.Coerce(int), vol.Range(min=10, max=120)),
         vol.Required(
             CONF_DEADBAND,
             default=values.get(CONF_DEADBAND, DEFAULT_DEADBAND),

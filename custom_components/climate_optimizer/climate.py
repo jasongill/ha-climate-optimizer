@@ -58,6 +58,8 @@ from .const import (
     CONF_HEAT_TARGET,
     CONF_MIN_CYCLE_TIME,
     CONF_OUTDOOR_TEMP_SENSOR,
+    CONF_RECOVERY_DELAY,
+    CONF_RECOVERY_MAX_OFFSET,
     CONF_ROOM_SENSOR_STALE_MINUTES,
     CONF_ROOM_SENSOR_STUCK_HOURS,
     CONF_SETTLING_TIME,
@@ -76,6 +78,8 @@ from .const import (
     DEFAULT_EMERGENCY_HEAT_SETPOINT,
     DEFAULT_HEAT_TARGET,
     DEFAULT_MIN_CYCLE_TIME,
+    DEFAULT_RECOVERY_DELAY,
+    DEFAULT_RECOVERY_MAX_OFFSET,
     DEFAULT_ROOM_SENSOR_STALE_MINUTES,
     DEFAULT_ROOM_SENSOR_STUCK_HOURS,
     DEFAULT_SETTLING_TIME,
@@ -86,6 +90,7 @@ from .const import (
     FAN_TIER_KEYS,
 )
 from .control import (
+    RecoveryCompensator,
     ThermalLearner,
     TemperatureTracker,
     confidence_aware_stop,
@@ -109,8 +114,8 @@ BIAS_EMA_ALPHA = 0.2
 # stale. We declare the downstream sensor STALE — and stop feeding it into
 # the bias EMA — when it has been unchanged for BIAS_STALE_AFTER_S while
 # the room sensor has moved by more than BIAS_STALE_ROOM_DELTA °F. The
-# previously-learned EMA still drives compensation while stale; we just
-# don't poison it with frozen data.
+# previously-learned EMA remains diagnostic only; recovery uses room
+# progress rather than this potentially misleading sensor difference.
 BIAS_STALE_AFTER_S = 10 * 60
 BIAS_STALE_ROOM_DELTA = 1.0
 
@@ -198,6 +203,17 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._cool_target = float(cfg.get(CONF_COOL_TARGET, DEFAULT_COOL_TARGET))
         self._deadband = float(cfg.get(CONF_DEADBAND, DEFAULT_DEADBAND))
         self._offset = float(cfg.get(CONF_SETPOINT_OFFSET, DEFAULT_SETPOINT_OFFSET))
+        self._recovery = RecoveryCompensator()
+        self._recovery_max_offset = min(
+            6.0,
+            max(
+                0.0,
+                float(cfg.get(CONF_RECOVERY_MAX_OFFSET, DEFAULT_RECOVERY_MAX_OFFSET)),
+            ),
+        )
+        self._recovery_delay = max(
+            10, int(cfg.get(CONF_RECOVERY_DELAY, DEFAULT_RECOVERY_DELAY))
+        )
         self._min_cycle = int(cfg.get(CONF_MIN_CYCLE_TIME, DEFAULT_MIN_CYCLE_TIME))
         self._settling_time = int(cfg.get(CONF_SETTLING_TIME, DEFAULT_SETTLING_TIME))
         self._tick_interval = int(cfg.get(CONF_TICK_INTERVAL, DEFAULT_TICK_INTERVAL))
@@ -541,6 +557,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "pushed_setpoint": self._last_pushed_setpoint,
             "active_fan_tier": self._last_fan_tier,
             "setpoint_offset": self._offset,
+            "recovery_max_offset": self._recovery_max_offset,
+            "recovery_offset": round(self._recovery.applied, 2),
+            "recovery_reason": self._recovery.reason,
             "fan_tiers": self._fan_tiers,
             "source_temp_sensor": self._source_temp,
             "source_humidity_sensor": self._source_humidity,
@@ -617,6 +636,12 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             )
             return
 
+        if (
+            new_heat != self._heat_target
+            or new_cool != self._cool_target
+            or (hvac_mode is not None and hvac_mode != self._attr_hvac_mode)
+        ):
+            self._recovery.reset("targets or mode changed")
         if hvac_mode is not None:
             self._attr_hvac_mode = hvac_mode
         self._heat_target = new_heat
@@ -627,6 +652,8 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         async with self._control_lock:
+            if hvac_mode != self._attr_hvac_mode:
+                self._recovery.reset("mode changed")
             self._attr_hvac_mode = hvac_mode
             if hvac_mode == HVACMode.OFF:
                 await self._async_stop_downstream()
@@ -690,6 +717,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         ds_state = self.hass.states.get(self._downstream)
         if ds_state is None or ds_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             self._downstream_disconnected = True
+            self._recovery.reset("downstream unavailable")
             self._thermal_learner.reset_observation()
             self._attr_hvac_action = HVACAction.IDLE
             self._decision_reason = (
@@ -741,6 +769,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
                         sensor_issue = f"stuck (value unchanged for >{self._room_sensor_stuck_s // 3600}h)"
 
         if sensor_issue is not None:
+            self._recovery.reset("room sensor " + sensor_issue)
             self._thermal_learner.reset_observation()
             await self._async_handle_room_sensor_lost(
                 ds_state, allow_heat, allow_cool, sensor_issue=sensor_issue
@@ -949,6 +978,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     def _record_cycle_start(self, mode: HVACMode) -> None:
         """Log a cycle start and reset per-cycle actuator state."""
+        self._recovery.reset("new cycle")
         if mode not in self._cycle_starts:
             return
         now = dt_util.utcnow()
@@ -1127,6 +1157,23 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             active_offset = gentle_setpoint_offset(error, self._offset)
             raw_setpoint = self._heat_target + active_offset
 
+        # Only observe confirmed normal operation after the startup settle
+        # window. Clip the accumulator to actuator headroom to avoid windup.
+        headroom = (
+            raw_setpoint - ds_min if mode == HVACMode.COOL else ds_max - raw_setpoint
+        )
+        recovery = self._recovery.update(
+            now,
+            mode=mode.value,
+            target=self._cool_target if mode == HVACMode.COOL else self._heat_target,
+            current=room_temp,
+            max_offset=min(self._recovery_max_offset, max(0.0, headroom)),
+            delay_minutes=self._recovery_delay,
+            confirmed=(
+                ds_state.state == mode.value and self._start_settle_remaining_s() == 0
+            ),
+        )
+        raw_setpoint += -recovery if mode == HVACMode.COOL else recovery
         setpoint = self._clamp(raw_setpoint, ds_min, ds_max, ds_step)
         available_fan = ds_state.attributes.get(ATTR_FAN_MODES) or []
 
@@ -1175,6 +1222,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             f"{setpoint:.0f}°F (target {offset_sign} {active_offset:.1f}°F "
             "gentle offset, "
             f"clamped to {ds_min:.0f}–{ds_max:.0f}). "
+            f"Recovery {offset_sign}{recovery:.1f}°F ({self._recovery.reason}). "
             f"Fan tier: {fan_mode or 'n/a'}.{bias_note}{trend_note}"
             f"{limit_note} {stop_label}."
         )
@@ -1276,6 +1324,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._last_fan_tier = None
 
     async def _async_stop_downstream(self) -> None:
+        self._recovery.reset("stopped")
         # Discard superseded actuator requests, but preserve an outstanding OFF
         # attempt so repeated idle ticks respect its backoff.
         for key in ("setpoint", "fan_mode"):

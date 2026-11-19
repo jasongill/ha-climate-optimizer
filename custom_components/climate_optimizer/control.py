@@ -392,3 +392,89 @@ def projected_stop(
     return current >= target or (
         projected > current and projected >= target - anticipation
     )
+
+
+class RecoveryCompensator:
+    """Bounded, elapsed-time recovery based on room progress, not unit bias.
+
+    A confirmed heating/cooling mode is not proof of compressor operation.
+    Wait through a full observation window before adding demand; short defrost
+    or modulation pauses must not cause an immediate boost. No state is restored.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self, reason: str = "inactive") -> None:
+        self.offset = 0.0
+        self.applied = 0.0
+        self.reason = reason
+        self._key: tuple[str, float] | None = None
+        self._since: datetime | None = None
+        self._last: datetime | None = None
+        self._baseline = 0.0
+        self._boosted = False
+
+    def update(
+        self,
+        now: datetime,
+        *,
+        mode: str,
+        target: float,
+        current: float,
+        max_offset: float,
+        delay_minutes: float,
+        confirmed: bool,
+    ) -> float:
+        if (
+            not all(
+                math.isfinite(x) for x in (target, current, max_offset, delay_minutes)
+            )
+            or delay_minutes <= 0
+            or mode not in ("heat", "cool")
+        ):
+            self.reset("invalid recovery input")
+            return 0.0
+        if max_offset <= 0 or not confirmed:
+            self.reset(
+                "disabled or no headroom"
+                if max_offset <= 0
+                else "waiting for confirmed mode / sensor settling"
+            )
+            return 0.0
+        direction = _mode_direction(mode)
+        error = (target - current) * direction
+        if error <= 0:
+            self.reset("target reached")
+            return 0.0
+        key = (mode, target)
+        gap = (now - self._last).total_seconds() if self._last else 0
+        if key != self._key or gap < 0 or gap > 300:
+            self.reset("collecting room recovery history")
+            self._key = key
+            self._since = now
+            self._baseline = current
+        self._last = now
+        self.offset = min(self.offset, max_offset)
+        progress = (current - self._baseline) * direction
+        elapsed = (now - self._since).total_seconds() / 60
+        if progress >= 0.25:
+            # Remove accumulated demand as the room responds; never wind it up
+            # merely because an improving room has not yet reached target.
+            self.offset = max(0.0, self.offset - 0.5)
+            self._since, self._baseline = now, current
+            self._boosted = False
+            self.reason = "room recovering; reducing compensation"
+        elif error < 0.5:
+            self._since, self._baseline = now, current
+            self._boosted = False
+            self.reason = "near target; tapering compensation"
+        elif elapsed >= (10 if self._boosted else delay_minutes):
+            self.offset = min(max_offset, self.offset + 0.5)
+            self._since, self._baseline = now, current
+            self._boosted = True
+            self.reason = "persistent shortfall; bounded recovery boost"
+        else:
+            self.reason = "observing room progress"
+        self.applied = self.offset * min(1.0, error / 0.5)
+        return self.applied
