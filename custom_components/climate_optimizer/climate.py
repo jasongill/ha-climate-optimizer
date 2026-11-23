@@ -47,12 +47,15 @@ from .const import (
     CONF_COOL_TARGET,
     CONF_DEADBAND,
     CONF_DOWNSTREAM_CLIMATE,
+    CONF_EMERGENCY_COOL_ABOVE_INDOOR,
     CONF_EMERGENCY_COOL_ABOVE_OUTDOOR,
     CONF_EMERGENCY_COOL_SETPOINT,
     CONF_EMERGENCY_ENABLE,
     CONF_EMERGENCY_FAN_MODE,
+    CONF_EMERGENCY_HEAT_BELOW_INDOOR,
     CONF_EMERGENCY_HEAT_BELOW_OUTDOOR,
     CONF_EMERGENCY_HEAT_SETPOINT,
+    CONF_EMERGENCY_INDOOR_ENABLE,
     CONF_FAN_LIMIT_MODE,
     CONF_FAN_LIMIT_UNTIL,
     CONF_HEAT_TARGET,
@@ -70,12 +73,15 @@ from .const import (
     CONF_TICK_INTERVAL,
     DEFAULT_COOL_TARGET,
     DEFAULT_DEADBAND,
+    DEFAULT_EMERGENCY_COOL_ABOVE_INDOOR,
     DEFAULT_EMERGENCY_COOL_ABOVE_OUTDOOR,
     DEFAULT_EMERGENCY_COOL_SETPOINT,
     DEFAULT_EMERGENCY_ENABLE,
     DEFAULT_EMERGENCY_FAN_MODE,
+    DEFAULT_EMERGENCY_HEAT_BELOW_INDOOR,
     DEFAULT_EMERGENCY_HEAT_BELOW_OUTDOOR,
     DEFAULT_EMERGENCY_HEAT_SETPOINT,
+    DEFAULT_EMERGENCY_INDOOR_ENABLE,
     DEFAULT_HEAT_TARGET,
     DEFAULT_MIN_CYCLE_TIME,
     DEFAULT_RECOVERY_DELAY,
@@ -87,6 +93,7 @@ from .const import (
     DEFAULT_START_MEASUREMENT_DELAY,
     DEFAULT_TICK_INTERVAL,
     DOMAIN,
+    EMERGENCY_INDOOR_HYSTERESIS,
     FAN_TIER_KEYS,
 )
 from .control import (
@@ -262,6 +269,17 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._emergency_fan_mode = str(
             cfg.get(CONF_EMERGENCY_FAN_MODE, DEFAULT_EMERGENCY_FAN_MODE)
         )
+
+        self._emergency_indoor_enable = bool(
+            cfg.get(CONF_EMERGENCY_INDOOR_ENABLE, DEFAULT_EMERGENCY_INDOOR_ENABLE)
+        )
+        self._emergency_heat_below_indoor = float(
+            cfg.get(CONF_EMERGENCY_HEAT_BELOW_INDOOR, DEFAULT_EMERGENCY_HEAT_BELOW_INDOOR)
+        )
+        self._emergency_cool_above_indoor = float(
+            cfg.get(CONF_EMERGENCY_COOL_ABOVE_INDOOR, DEFAULT_EMERGENCY_COOL_ABOVE_INDOOR)
+        )
+        self._emergency_indoor_mode: HVACMode | None = None
 
         self._attr_hvac_mode = HVACMode.HEAT_COOL
         self._attr_hvac_action = HVACAction.IDLE
@@ -567,6 +585,9 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             "outdoor_temp_sensor": self._outdoor_sensor,
             "emergency_enabled": self._emergency_enable,
             "emergency_active": self._emergency_active,
+            "emergency_indoor_enabled": self._emergency_indoor_enable,
+            "emergency_heat_below_indoor": self._emergency_heat_below_indoor,
+            "emergency_cool_above_indoor": self._emergency_cool_above_indoor,
             "last_transition": self._last_transition.isoformat()
             if self._last_transition
             else None,
@@ -717,6 +738,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         ds_state = self.hass.states.get(self._downstream)
         if ds_state is None or ds_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             self._downstream_disconnected = True
+            self._emergency_indoor_mode = None
             self._recovery.reset("downstream unavailable")
             self._thermal_learner.reset_observation()
             self._attr_hvac_action = HVACAction.IDLE
@@ -735,6 +757,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             self._downstream_disconnected = False
 
         if self._attr_hvac_mode == HVACMode.OFF:
+            self._emergency_indoor_mode = None
             await self._async_stop_downstream()
             self._thermal_learner.reset_observation()
             self._decision_reason = "Virtual device is OFF"
@@ -782,6 +805,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             return
 
         self._emergency_active = False
+        self._emergency_indoor_mode = None
 
         # Keep a short, de-duplicated history from the real room sensor.  The
         # median filters single-sample spikes and the fitted slope lets us stop
@@ -994,6 +1018,37 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
 
     # ------------------------------------------------------------------ room sensor lost
 
+    def _indoor_emergency_guard(self, ds_state: State) -> HVACMode | None:
+        """Use the unit reading only as a coarse guard, never as room feedback."""
+        indoor = _as_float_attr(ds_state.attributes.get("current_temperature"))
+        reported = getattr(ds_state, "last_reported", ds_state.last_updated)
+        age = (dt_util.utcnow() - reported).total_seconds()
+        if (
+            not self._emergency_indoor_enable
+            or indoor is None
+            or not math.isfinite(indoor)
+            or age < 0
+            or age > DEFAULT_ROOM_SENSOR_STALE_MINUTES * 60
+        ):
+            self._emergency_indoor_mode = None
+            return None
+
+        heat_below = self._emergency_heat_below_indoor
+        cool_above = self._emergency_cool_above_indoor
+        if indoor <= heat_below:
+            self._emergency_indoor_mode = HVACMode.HEAT
+        elif indoor >= cool_above:
+            self._emergency_indoor_mode = HVACMode.COOL
+        elif (
+            self._emergency_indoor_mode == HVACMode.HEAT
+            and indoor >= heat_below + EMERGENCY_INDOOR_HYSTERESIS
+        ) or (
+            self._emergency_indoor_mode == HVACMode.COOL
+            and indoor <= cool_above - EMERGENCY_INDOOR_HYSTERESIS
+        ):
+            self._emergency_indoor_mode = None
+        return self._emergency_indoor_mode
+
     async def _async_handle_room_sensor_lost(
         self,
         ds_state: State,
@@ -1005,6 +1060,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         was_emergency = self._emergency_active
 
         if not self._emergency_enable:
+            self._emergency_indoor_mode = None
             if not was_emergency and self._active_mode is not None:
                 _LOGGER.warning(
                     "Source temp sensor %s %s and emergency mode "
@@ -1023,11 +1079,25 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         outdoor_temp = self._outdoor_temperature()
 
         desired: HVACMode | None = None
-        if outdoor_temp is not None:
+        guard_mode = self._indoor_emergency_guard(ds_state)
+        trigger = ""
+        if guard_mode is not None:
+            # An indoor guard takes priority even if the outdoor sensor disagrees.
+            # Never command the opposite mode when the selected mode forbids it.
+            indoor = float(ds_state.attributes["current_temperature"])
+            trigger = f"unit indoor safety guard ({indoor:.1f}°F; reading may be biased)"
+            if (guard_mode == HVACMode.HEAT and allow_heat) or (
+                guard_mode == HVACMode.COOL and allow_cool
+            ):
+                desired = guard_mode
+            else:
+                trigger += "; required mode is not enabled"
+        elif outdoor_temp is not None and math.isfinite(outdoor_temp):
             if allow_heat and outdoor_temp < self._emergency_heat_below:
                 desired = HVACMode.HEAT
             elif allow_cool and outdoor_temp > self._emergency_cool_above:
                 desired = HVACMode.COOL
+            trigger = f"outdoor fallback ({outdoor_temp:.1f}°F)"
 
         if desired is None:
             if not was_emergency:
@@ -1044,9 +1114,8 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             )
             self._decision_reason = (
                 f"EMERGENCY STANDBY: room sensor {self._source_temp} "
-                f"{sensor_issue}, outdoor {outdoor_str}. Within safe band "
-                f"({self._emergency_heat_below:.0f}–"
-                f"{self._emergency_cool_above:.0f}°F), downstream off."
+                f"{sensor_issue}, outdoor {outdoor_str}. "
+                f"{trigger or 'No usable emergency trigger'}; downstream off."
             )
             self.async_write_ha_state()
             return
@@ -1054,17 +1123,14 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         # Apply min-cycle gate to emergency transitions too — only on turn-on.
         remaining = self._transition_hold_remaining(desired)
         if remaining:
-            if self._active_mode is None:
-                self._emergency_active = False
-                self._attr_hvac_action = HVACAction.IDLE
-                self._decision_reason = (
-                    f"Min cycle hold: emergency wants to start {desired.value}, "
-                    f"but {remaining}s remain of min_cycle_time "
-                    f"({self._min_cycle}s)."
-                )
-                self.async_write_ha_state()
-                return
-            desired = self._active_mode
+            # Do not continue the opposite mode during a safety-driven reversal.
+            await self._async_go_idle()
+            self._decision_reason = (
+                f"Min cycle hold: {trigger} requests {desired.value}, "
+                f"but {remaining}s remain of min_cycle_time ({self._min_cycle}s)."
+            )
+            self.async_write_ha_state()
+            return
 
         if desired != self._active_mode:
             self._active_mode = desired
@@ -1092,20 +1158,16 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         self._last_pushed_setpoint = setpoint
         self._last_fan_tier = self._emergency_fan_mode
 
-        cmp_str = "<" if desired == HVACMode.HEAT else ">"
-        thresh = (
-            self._emergency_heat_below
-            if desired == HVACMode.HEAT
-            else self._emergency_cool_above
-        )
         self._decision_reason = (
             f"EMERGENCY {desired.value.upper()}: room sensor "
-            f"{self._source_temp} {sensor_issue}, outdoor {outdoor_temp:.1f}°F "
-            f"{cmp_str} threshold {thresh:.0f}°F. "
+            f"{self._source_temp} {sensor_issue}; {trigger}. "
             "Driving downstream at fixed emergency setpoint."
         )
 
+        emergency_reason = self._decision_reason
         self._report_requested_action(desired)
+        if self._decision_reason != emergency_reason:
+            self._decision_reason = emergency_reason + " " + self._decision_reason
         self.async_write_ha_state()
 
     # ------------------------------------------------------------------ downstream drive
