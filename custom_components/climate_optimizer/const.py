@@ -120,3 +120,12 @@ CONF_RECOVERY_MAX_OFFSET = "recovery_max_offset"
 CONF_RECOVERY_DELAY = "recovery_delay"
 DEFAULT_RECOVERY_MAX_OFFSET = 0.0
 DEFAULT_RECOVERY_DELAY = 25  # minutes
+
+# Conservative unit-sensor guardrails used only while the room sensor is lost.
+CONF_EMERGENCY_INDOOR_ENABLE = "emergency_indoor_enable"
+DEFAULT_EMERGENCY_INDOOR_ENABLE = True
+CONF_EMERGENCY_HEAT_BELOW_INDOOR = "emergency_heat_below_indoor"
+DEFAULT_EMERGENCY_HEAT_BELOW_INDOOR = 55.0
+CONF_EMERGENCY_COOL_ABOVE_INDOOR = "emergency_cool_above_indoor"
+DEFAULT_EMERGENCY_COOL_ABOVE_INDOOR = 85.0
+EMERGENCY_INDOOR_HYSTERESIS = 5.0

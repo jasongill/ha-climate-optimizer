@@ -125,7 +125,9 @@ For power users. Most installs should begin with the defaults and tune from obse
 | Start measurement delay | Seconds to ignore stop threshold after cycle start (avoids sensor blowby false stops) | 120 |
 | Room sensor stale minutes | If the room sensor hasn't reported in this many minutes (unchanged readings count as reports), treat it as lost and trigger emergency mode (0 to disable) | 60 |
 | Fan tiers (4 tiers) | Maps error-from-target to a fan mode name. Defaults: ≤1°F → `low`, ≤3°F → `medium`, ≤5°F → `high`, everything else → `turbo`. Fan mode names are free-form strings, so any downstream unit's naming works. | See left |
-| Emergency fallback | When the room sensor goes offline or stale: optionally force heat/cool based on outdoor temp to protect the room. | Enabled |
+| Emergency fallback | When the room sensor is unavailable, stale, or stuck: use coarse unit-indoor guardrails and outdoor-temperature fallback. | Enabled |
+| Unit indoor emergency guard | Use the mini split's reported indoor temperature only for emergency protection while the room sensor is lost | Enabled |
+| Indoor emergency thresholds | Heat at or below 55°F; cool at or above 85°F. Configurable ranges: 40–60°F for heat, 80–100°F for cool | 55 / 85 |
 | Outdoor temp sensor | For seasonal learning and emergency fallback decisions | — |
 | Emergency thresholds | Force heat below 40°F outdoor, force cool above 90°F outdoor | 40 / 90 |
 | Emergency setpoints | Conservative fixed setpoints during emergency | Heat 62°F, Cool 80°F |
@@ -195,3 +197,35 @@ This integration is distributed via [HACS](https://hacs.xyz/) as a custom reposi
 - Home Assistant **2026.3** or newer.
 - A downstream `climate` entity that supports `heat`, `cool`, `off`, a `target_temperature`, and one or more `fan_modes`.
 - A `sensor` entity reporting room temperature (device_class `temperature`). Humidity and outdoor temperature sensors are optional.
+
+
+### Unit indoor sensor emergency guard
+
+When the external room sensor is unavailable, has not reported for the configured
+timeout (default 60 minutes), or has not changed for the configured stuck timeout
+(default 12 hours), the optimizer can use the mini split's `current_temperature`
+as a coarse emergency guard. This reading never replaces the room sensor for
+normal comfort control, thermal learning, or recovery compensation.
+
+By default, a unit reading at or below **55°F** requests emergency heating at
+**62°F**; a reading at or above **85°F** requests emergency cooling at **80°F**.
+The existing emergency setpoints and fan setting are used. The indoor guard
+releases after a 5°F recovery: heating at 60°F, cooling at 80°F with default
+thresholds. Existing outdoor fallback can still request operation after release.
+Choose emergency setpoints that allow the unit to reach the guard's release
+temperature if customizing the thresholds.
+
+Indoor guard requests take precedence over conflicting outdoor requests. The
+selected HVAC mode, OFF setting, emergency enable setting, and minimum cycle
+time are respected. If the required mode is not enabled, the opposite mode is
+not commanded. A reversal stops the opposite operation before waiting for the
+minimum cycle time. Normal room-sensor control resumes when that sensor is
+usable again, with the normal startup/transition safeguards.
+
+The unit sensor may be biased by mounting position, airflow, or frozen telemetry.
+These broad thresholds provide precautionary protection, not accurate room
+temperature limits. Missing/non-finite readings or downstream entity reports
+older than 60 minutes are ignored, retaining the outdoor fallback. A recent
+entity report does not prove that its indoor-temperature measurement refreshed.
+No learned sensor-bias correction is applied. The indoor guard is configurable
+in Advanced settings and can be disabled separately.
