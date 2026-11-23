@@ -350,6 +350,43 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.device._active_mode)
         self.assertIn("Min cycle hold", self.device._decision_reason)
 
+    async def test_unchanged_temperature_with_recent_report_keeps_control_running(self):
+        room = self.states["sensor.room"]
+        room.last_updated -= timedelta(hours=2)
+        room.last_changed = room.last_updated
+        room.last_reported = datetime.now(timezone.utc)
+        await self.device._async_control()
+        self.assertFalse(self.device._emergency_active)
+        self.assertEqual(self.device._active_mode, HVACMode.COOL)
+
+    async def test_missing_reports_trigger_stale_fallback(self):
+        room = self.states["sensor.room"]
+        room.last_reported = datetime.now(timezone.utc) - timedelta(hours=2)
+        room.last_updated = room.last_reported
+        room.last_changed = room.last_reported
+        await self.device._async_control()
+        self.assertIn("stale", self.device._decision_reason)
+        self.assertIsNone(self.device._active_mode)
+
+        # A repeated report, without a temperature change, restores control.
+        room.last_reported = datetime.now(timezone.utc)
+        await self.device._async_control()
+        self.assertFalse(self.device._emergency_active)
+        self.assertEqual(self.device._active_mode, HVACMode.COOL)
+
+    async def test_recent_reports_do_not_bypass_stuck_value_protection(self):
+        room = self.states["sensor.room"]
+        room.last_reported = datetime.now(timezone.utc)
+        room.last_changed -= timedelta(hours=13)
+        await self.device._async_control()
+        self.assertIn("stuck", self.device._decision_reason)
+        self.assertIsNone(self.device._active_mode)
+
+    async def test_legacy_state_without_report_timestamp_uses_last_updated(self):
+        self.states["sensor.room"].last_updated -= timedelta(hours=2)
+        await self.device._async_control()
+        self.assertIn("stale", self.device._decision_reason)
+
     async def test_mode_setter_waits_for_inflight_control(self):
         await self.device._control_lock.acquire()
         task = asyncio.create_task(self.device.async_set_hvac_mode(HVACMode.OFF))

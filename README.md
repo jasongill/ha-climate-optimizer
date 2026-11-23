@@ -123,7 +123,7 @@ For power users. Most installs should begin with the defaults and tune from obse
 | Maximum room mixing time | Maximum seconds to observe room mixing after shutdown while demand remains satisfied | 120 |
 | Control loop interval | Safety-net tick in addition to sensor updates (s) | 30 |
 | Start measurement delay | Seconds to ignore stop threshold after cycle start (avoids sensor blowby false stops) | 120 |
-| Room sensor stale minutes | If the room sensor hasn't updated in this many minutes, treat it as lost and trigger emergency mode (0 to disable) | 60 |
+| Room sensor stale minutes | If the room sensor hasn't reported in this many minutes (unchanged readings count as reports), treat it as lost and trigger emergency mode (0 to disable) | 60 |
 | Fan tiers (4 tiers) | Maps error-from-target to a fan mode name. Defaults: ≤1°F → `low`, ≤3°F → `medium`, ≤5°F → `high`, everything else → `turbo`. Fan mode names are free-form strings, so any downstream unit's naming works. | See left |
 | Emergency fallback | When the room sensor goes offline or stale: optionally force heat/cool based on outdoor temp to protect the room. | Enabled |
 | Outdoor temp sensor | For seasonal learning and emergency fallback decisions | — |

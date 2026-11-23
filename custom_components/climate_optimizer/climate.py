@@ -748,7 +748,7 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
         room_temp = self.current_temperature
         self._last_room_temp = room_temp
 
-        # Treat the room sensor as lost if it has no value, hasn't updated
+        # Treat the room sensor as lost if it has no value, hasn't reported
         # in over an hour (integration down), or has been reporting the
         # exact same value for 12+ hours (sensor likely offline but the
         # integration is still echoing the last reading — X-Sense does this).
@@ -760,9 +760,14 @@ class VirtualClimateDevice(ClimateEntity, RestoreEntity):
             if room_state is not None:
                 now_utc = dt_util.utcnow()
                 if self._room_sensor_stale_s > 0:
-                    age = (now_utc - room_state.last_updated).total_seconds()
+                    # Identical readings refresh last_reported, not last_updated.
+                    # Keep the latter as a fallback for older HA State objects.
+                    last_reported = getattr(
+                        room_state, "last_reported", room_state.last_updated
+                    )
+                    age = (now_utc - last_reported).total_seconds()
                     if age > self._room_sensor_stale_s:
-                        sensor_issue = f"stale (no update for >{self._room_sensor_stale_s // 60}min)"
+                        sensor_issue = f"stale (no report for >{self._room_sensor_stale_s // 60}min)"
                 if sensor_issue is None and self._room_sensor_stuck_s > 0:
                     stuck_age = (now_utc - room_state.last_changed).total_seconds()
                     if stuck_age > self._room_sensor_stuck_s:
